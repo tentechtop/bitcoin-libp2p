@@ -1,0 +1,90 @@
+bitcoin:
+  # 可选值：mainnet(主网)、testnet3(测试网3)、testnet4(测试网4)、simnet(模拟网)、regtest(回归网)、signet(签名网)
+  netVersion: mainnet
+  #本地节点端口
+  peerPort: 4002
+  #本地节点RPC端口
+  rpcPort: :4003
+  debugPort: 4444
+  enable_quic: true
+  enable_mdns: true
+  #引导节点101.35.87.31  - "/ip4/127.0.0.1/tcp/5002/p2p/12D3KooWLuKtBUqu32xT9haEzTEbWkHtekB6FcSr6j67TsMxpXBc"
+  bootstrap_peers:
+    - "/ip4/101.35.87.31/tcp/5002/p2p/12D3KooWCinkKLbJqZajLzEK9eJ8m9pxsaS2AsApsU4frh77LJ5e"
+  dataDir: "/btc/data/chaindata/network"
+  logDir: "/btc/data/log"
+  #白名单节点
+  whitelists:
+    - "/ip4/127.0.0.1/tcp/5002/p2p/12D3KooWPFPVSXps7gstL1wonMz5CWdnYSDW4ymXSmqWK6APeM3C"
+  #禁用Ban功能
+  disableBanning: false
+  #违规 Peer 的 Ban 时长（支持单位：s = 秒、m = 分、h = 时，最小 1 秒）
+  banDuration: 24h
+  #违规行为（如发送无效区块 / 交易）会累积分数，默认阈值通常为 100
+  banThreshold: 100
+  #内存中允许存储的「孤儿交易」（依赖未确认交易的交易）最大数量
+  maxOrphanTxs: 1000
+  #指定全局 SOCKS5 代理地址（如 127.0.0.1:1080） 所有 Peer 连接均通过该代理，用于突破网络限制（非 Tor 场景）
+  proxy:
+    enable: false
+    proxyUser: admin
+    proxyPass: admin
+  #开启后不保存主链的区块
+  prune: false
+  utxoCacheMaxSizeMiB: 100
+  #指定「签名验证缓存」的最大条目数
+  sigCacheMaxSize: 500000
+  RPCMaxClients: 25
+  RPCMaxConcurrentReqs: 100
+  #"F:\\btc\\cpu.prof"
+  cpuProfile:
+  #"F:\\btc\\mem.prof"
+  memoryProfile:
+  #"F:\\btc\\trace.out"
+  traceProfile:
+  # 开启地址索引
+  addrIndex: true
+  txIndex: true
+  #删除地址索引
+  dropAddrIndex: false
+  #删除交易索引
+  dropTxIndex: false
+  #初始难度目标  0000ffffffff0000000000000000000000000000000000000000000000000000
+  initDifficultyTarget: "0000ffffffff0000000000000000000000000000000000000000000000000000"
+  adjustmentInterval: 2016
+  #单位秒 出块时间 600秒是10分钟
+  blockGenerationTime: 30
+  #减半周期
+  halvingPeriod: 20
+  blockMinWeight: 0
+  blockMaxWeight: 3000000
+  #区块大小
+  blockMinSize: 0
+  blockMaxSize: 750000
+  blockPrioritySize: 50000
+  minRelayTxFee: 0
+  noRelayPriority: true
+  relayNonStd: true
+  freeTxRelayLimit: 100000
+  #若设为true，则禁止交易替换，防止恶意替换导致的混乱；设为false则允许 RBF（更灵活）。
+  rejectReplacement: true
+
+mining:
+  startMining: true # false  关闭挖矿 true  开启挖矿
+  miningType: 1 # 1CPU 2GPU
+  miner:
+    #基础奖励地址 #未配置就会使用中本聪的地址 配置多个就轮询
+    minerAddress:
+      - bc1qsn8w5cy7xm652g2dt8fzjfe8a39rwv0z9pwcc9
+    #是否合并交易输出
+    mergeTxOut: true
+
+chain:
+  #禁用内置检查点
+  disableCheckpoints: true
+  #添加自定义区块链检查点，格式为 <区块高度>:<区块哈希>  默认使用内置的主网 / 测试网检查点
+  addCheckpoints:
+    - 3333:000001231223213213213123123123213
+
+
+

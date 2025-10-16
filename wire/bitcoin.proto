@@ -1,0 +1,621 @@
+syntax = "proto3";
+//import "tx.proto";        // 复用前面定义的 ProtoMsgTx
+package wire;
+
+option go_package = "/wire";
+
+
+//消息字段（属性）	snake_case（下划线分隔，全小写）	最核心的规范！字段名必须用 全小写 + 下划线分隔，禁止 PascalCase/CamelCase。	ProtocolVersion、UserAgent、GenesisHash	protocol_version、user_agent、genesis_hash
+//消息名（message）	PascalCase（首字母大写驼峰）	每个单词首字母大写，无下划线，如 Message、GetBlockRequest。	你的 ProtoHandshake、ProtoMsgTx 是正确的	ProtoHandshake（正确）、ProtoUtxoEntry（正确）
+//服务名（service）	PascalCase（首字母大写驼峰）	服务名与消息名规则一致，如 Node 服务（你的文件中是正确的）。	-（你的 Node 服务名正确）	Node（正确）、BlockService（示例）
+//枚举类型名（enum）	PascalCase	枚举类型名用首字母大写驼峰，如 ErrorCode。	-（你的文件中无枚举，补充参考）	TxFlag（示例）
+//枚举成员（enum value）	UPPER_SNAKE_CASE（全大写下划线）	枚举成员必须全大写 + 下划线分隔，如 TX_COIN_BASE。	-（你的文件中无枚举，补充参考）	TF_COIN_BASE（对应你的 tfCoinBase）
+//包名（package）	全小写（可含下划线）	包名用全小写，如你的 wire 包（正确），复杂包名可加下划线（如 my_project.wire）。	-（你的 wire 包名正确）	wire（正确）、block_chain.wire（示例）
+//导入路径（import）	全小写（遵循文件系统）	导入的 .proto 文件路径用全小写，如 import "tx.proto"
+
+
+
+// 定义服务
+service BitCoinRpc {
+  // 支持同时提供原二进制接口和 DTO 接口（按需选择）
+  rpc SendMessage(Message) returns (Message);          // 原接口（二进制）
+  rpc GetBlock(GetBlockRequest) returns (GetBlockReply);              // 原接口（二进制）
+  rpc GetBlockDTO(GetBlockRequestDTO) returns (GetBlockReplyDTO);     // DTO 接口（Hex 可读）
+  rpc SubmitTransaction(ProtoMsgTx) returns (CommonResp); //返回二进制
+  //启动挖矿
+  rpc StartMining(Message) returns (Message);
+  //暂停挖矿
+  rpc StopMining(Message) returns (Message);
+  //提交一笔交易
+  rpc JsonSubmitTransaction(ProtoMsgTxDTO) returns (CommonResp);//返回JSON
+
+  //查询所有区块 仅测试 后续会删除  返回区块列表
+  rpc GetAllBlock(Message) returns (BlockList);
+
+  //查询所有UTXO 仅测试 后续会删除  返回UTXO列表
+  rpc GetAllUTXO(Message) returns (UtxoList);
+
+  //查询地址下所有的UTXO String类型的地址
+  rpc GetAddressAllUTXO(GetAddressAllUtxoRequest) returns (UtxoList);
+
+  rpc GetMainBlockByHeight(GetMainBlockByHeightReq) returns (GetBlockReplyDTO);
+
+  //查询当前区块链快照
+  rpc GetMainStatus(Message) returns (Message);
+
+  /*JSON*/
+  rpc GetBlockByHash(GetBlockByHashReq) returns (JsonBlock);
+
+  //根据
+  rpc GetBlockByHeight(GetBlockByHeightReq) returns (JsonBlock);
+
+  //根据交易ID查询交易
+  rpc GetTxByTxId(GetTxByTxIdReq) returns (JsonTx);
+
+  //根据交易Id和输出索引查询UTXO
+  rpc GetUTXOByTxIdAndOutIndex(GetUTXOByTxIdAndOutIndexReq) returns (JsonUTXO);
+
+  //获取所有的节点
+  rpc GetAllConnectPeer(Message) returns (Message);
+
+  //创建钱包
+  rpc CreateWallet(CreateWalletReq) returns (JsonWallet);
+
+  //根据助记词生成以太坊地址
+  rpc CreateEthAddressByMnemonic(CreateEthAddressByMnemonicReq) returns (EthAddress);
+
+  rpc CreateBtcAddressByMnemonic(CreateBtcAddressByMnemonicReq) returns (BtcAddress);
+
+  //地址到地址的转账  发送方要携带助记词和密码
+  rpc BitCoinTransfer(TransferReq) returns (JsonTx);
+
+  //根据地址获取未确认交易
+  rpc GetUnconfirmedTxByAddress(GetTxByAddressReq) returns (GetTxByAddressRes);
+
+  //查询地址下所有的已经确认的交易
+  rpc GetConfirmedTxByAddress(GetTxByAddressReq) returns (GetTxByAddressRes);
+
+  //获取已经连接且握手的节点
+  rpc GetOnlineAndHandshakePeer(GetPeerReq) returns (GetPeerRes);
+
+  //根据节点ID查询节点信息
+  rpc GetPeerById(GetPeerReq) returns (GetPeerRes);
+
+  //根据服务能力查询已经连接且握手的节点
+  rpc GetPeerByCondition(ProtoPersistentPeer) returns (GetPeerRes);
+
+  //获取所有持久化节点即使未在线
+  rpc GetAllPeer(GetPeerReq) returns (GetPeerRes);
+
+  //查询根据地址查询UTXO 从UTXO缓存中获取
+  rpc GetUTXOByAddressAndCache(GetAddressAllUtxoRequest) returns (UtxoList);
+
+  rpc GetCachaeUTXO(GetAddressAllUtxoRequest) returns (UtxoList);
+}
+
+message ProtoBlockBodyList{
+  repeated ProtoMsgBlockBody body_list = 1;
+}
+
+
+message ProtoGetBlock{
+  repeated bytes hash_list = 1;
+}
+
+message ProtoGetHeaders{
+  int32 start_height = 1;
+  int32 end_height = 2;
+  bytes end_hash = 3;
+}
+
+message ProtoHeaderList{
+  repeated ProtoBlockHeader header_list = 1;
+}
+
+message BlockIndex{
+  bytes hash = 1; //区块Hash
+  int32 height = 2;//区块高度
+}
+
+message SyncIndex{
+  string peer_id = 2; //节点ID
+  repeated BlockIndex index = 1;//同步索引
+}
+
+message GetPeerReq{
+  string ID = 1;                          // 节点ID
+  repeated ServiceFlag services = 2;      // 服务能力
+}
+
+message GetPeerRes{
+  repeated ProtoPersistentPeer peer_list = 1;
+}
+
+message GetTxByAddressReq{
+  string address = 1; //地址
+}
+
+message GetTxByAddressRes{
+  repeated JsonTx Txs = 1; //未确认交易
+}
+
+message TransferReq {
+  string mnemonic = 1; //助记词
+  uint32 index = 2; //输出索引
+  string address_type = 3; //地址类型
+  string net_type = 4; //地址类型
+  string to_address = 5; //目标地址
+  int64  amount       = 6;  // 金额（聪）
+}
+
+message TxLocation {
+  bytes  hash  = 1; //区块Hash
+  uint32 index = 2; //交易所在位置
+}
+
+//根据Hash获取区块
+message GetBlockByHashReq {
+  string hash = 1;
+}
+message GetBlockByHeightReq {
+  int32 height = 1;
+}
+
+message GetTxByTxIdReq {
+  string tx_id = 1;
+}
+
+message GetUTXOByTxIdAndOutIndexReq {
+  string tx_id = 1; //交易ID
+  uint32 index = 2; //输出索引
+}
+
+message CreateEthAddressByMnemonicReq {
+  string mnemonic = 1; //助记词
+  uint32 index = 2; //输出索引
+}
+
+message CreateBtcAddressByMnemonicReq {
+  string mnemonic = 1; //助记词
+  uint32 index = 2; //输出索引
+  string address_type = 3; //地址类型
+  string net_type = 4; //地址类型
+}
+
+message EthAddress {
+  string address = 1; //地址
+  uint32 index = 2; //输出索引
+}
+
+message BtcAddress {
+  string address = 1; //地址
+  uint32 index = 2; //输出索引
+}
+
+
+message CreateWalletReq {
+  string name = 1; //钱包名称
+  string password = 2;//明文密码
+  string passwordHint = 3;//密码提示
+}
+
+message JsonWallet {
+  string name = 1; //钱包名称
+  string password = 2;//明文密码
+  string passwordHint = 3;//密码提示
+  string mnemonic = 4;//助记词
+}
+
+
+// 连接方向（参考 btcd 的 ConnDirection）
+enum ConnectionDirection {
+  DIR_UNKNOWN = 0;  // 未知方向
+  DIR_INBOUND = 1;  // 入站连接（其他节点主动连接本地）
+  DIR_OUTBOUND = 2; // 出站连接（本地主动连接其他节点）
+}
+
+// 握手状态
+enum HandshakeStatus {
+  HANDSHAKE_NOT_STARTED = 0;  // 未开始
+  HANDSHAKE_IN_PROGRESS = 1;  // 进行中
+  HANDSHAKE_COMPLETED = 2;    // 已完成
+  HANDSHAKE_FAILED = 3;       // 已失败
+}
+
+// 节点服务能力标志（参考 btcd 的 ServiceFlag）
+enum ServiceFlag {
+  SERVICE_NONE = 0;          // 无特殊服务
+  SERVICE_FULL_NODE = 1;     // 全节点（存储完整区块链）
+  SERVICE_SPV = 2;           // SPV节点（简化支付验证）
+  SERVICE_MINER = 4;         // 挖矿节点（支持挖矿相关消息）
+  SERVICE_RELAY = 8;         // 中继节点（转发交易和区块）
+
+    SFNodeNetwork = 16;
+  //表示节点支持 getutxos 和 utxos 命令，对应 BIP0064 协议。这些命令用于查询未花费交易输出（UTXO）集合，帮助其他节点快速获取特定地址的可用资金信息。
+    SFNodeGetUTXO = 32 ;
+  //表示节点支持「布隆过滤」（bloom filtering）功能。布隆过滤器是轻量级节点（如 SPV 节点）常用的技术，可高效筛选出与自身相关的交易，减少不必要的数据传输（例如只同步涉及自己地址的交易）。
+    SFNodeBloom = 64;
+  //表示节点支持包含「见证数据」（witness data）的区块和交易，对应 BIP0144 协议（隔离见证，Segregated Witness）。隔离见证将交易的签名数据（见证）与交易核心数据分离，提升了交易容量和安全性，该标志说明节点可处理这类新型交易和区块。
+    SFNodeWitness = 128;
+  //表示节点支持「xthin blocks」（精简区块）。这是一种区块传播优化技术，类似于「紧凑区块」（compact blocks），通过只传输区块中必要的差异数据（而非完整区块），减少网络带宽消耗，加快区块同步速度。
+    SFNodeXthin = 256;
+  //占位标志，用于表示第 5 位定义的服务。具体功能未在注释中说明，可能是预留位或特定实现中自定义的扩展功能。
+    SFNodeBit5 = 512;
+  //表示节点支持「承诺过滤器」（committed filters，CFs），对应 BIP157 和 BIP158 协议。承诺过滤器是一种带密码学承诺的区块过滤机制，帮助轻节点快速定位包含目标交易的区块，同时保证过滤结果的真实性
+    SFNodeCF = 1024;
+  //表示节点运行「Segwit2X」软件。Segwit2X 是 2017 年的一个比特币协议提案，计划结合隔离见证（Segwit）和区块大小扩容至 2MB，该标志用于识别支持该提案的节点（注：该提案最终未被广泛采用）。
+    SFNode2X = 2048;
+  //表示节点支持仅提供「最近 288 个区块」的数据（约 1 天的区块量，按 10 分钟一个区块计算）。这是一种轻量版全节点，不存储完整区块链历史，仅保留近期数据，适合资源有限的设备。
+    SFNodeNetworkLimited = 4096;
+  //表示节点支持 BIP324 定义的「P2P 协议 v2」。该版本协议引入了加密通信、更高效的握手机制等改进，提升了节点间通信的安全性和兼容性。
+    SFNodeP2PV2 = 8192;
+
+}
+
+
+
+
+
+
+// ProtoPersistentPeer 扩展版：参考 btcd 节点存储逻辑
+message ProtoPersistentPeer {
+  // 基础标识（原有字段保留并扩展）
+  string ID = 1;                          // libp2p PeerID 字符串
+  repeated string addrs = 2;              // 多地址列表（multiaddr 字符串）
+  int64 last_seen = 3;                    // 最后活跃时间戳（秒级）
+
+  // 1. 连接元数据（新增）
+  ConnectionDirection direction = 4;      // 连接方向
+  int64 conn_time = 5;                    // 连接建立时间戳
+  int64 disconn_time = 6;                 // 最后断开时间戳（-1 表示当前连接）
+  string user_agent = 7;                  // 用户代理（如 /myblockchain-v0.1.0/libp2p/）
+
+  // 2. 协议与能力（新增）
+  uint32 protocol_version = 8;            // 协商后的 P2P 协议版本
+  repeated ServiceFlag services = 9;      // 支持的服务能力
+  repeated string supported_msgs = 10;    // 支持的消息类型列表
+
+  // 3. 连接质量（新增）
+  uint32 rtt = 11;                        // 往返延迟（毫秒）
+  map<string, uint64> msg_count = 12;     // 消息类型统计（如 "block": 100）
+  uint64 bytes_sent = 13;                 // 累计发送字节数
+  uint64 bytes_recv = 14;                 // 累计接收字节数
+  float  uptime_ratio = 15;              // 历史 uptime 占比（0.0~1.0）
+
+  // 4. 安全与行为（新增）
+  uint32 ban_score = 16;                  // 违规积分（达到阈值封禁）
+  int64 ban_until = 17;                   // 封禁截止时间戳（-1 表示未封禁）
+  string last_err = 18;                   // 最后一次错误信息
+  HandshakeStatus handshake_status = 19;  // 握手状态
+
+  // 5. 重连策略（新增）
+  uint32 retry_count = 20;                // 历史重连次数
+  uint32 retry_interval = 21;             // 下次重连间隔（秒）
+  bool is_trusted = 22;                   // 是否为可信节点
+  bool is_online = 23;                   // 是否为可信节点
+  int64 fee_filter = 24;                   // 手续费过滤
+
+  bytes last_announced_block = 25;
+  int32  last_block_height = 26;
+}
+
+
+//根据区块Hash查询 输出给用户的完整区块JSON
+message JsonBlock {
+  string hash = 1;
+  int32 height = 2;
+
+  string chain_work = 10;
+
+  int32  version = 3;
+  string prev_block = 4;
+  string merkle_root = 5;
+  int64  timestamp = 6;
+  uint32 bits = 7;
+  uint32 nonce = 8;
+
+  bool is_main_chain = 13; //是否主链区块
+
+  repeated JsonTx transactions = 12;
+}
+
+
+//根据交易ID查询 输出给用户的完整交易JSON
+message JsonTx {
+  string txId = 5;           //交易ID
+  int32 version = 1;           // 不变
+  repeated ProtoTxInDTO tx_in = 2; // 引用 DTO 版本的交易输入
+  repeated ProtoTxOutDTO tx_out = 3; // 引用 DTO 版本的交易输出
+  uint32 lock_time = 4;        // 不变
+}
+
+//根据交易ID和输出索引查询UTXO
+message JsonUTXO {
+  int64  amount       = 1;  // 金额（聪）
+  string  pk_script    = 2;  // 锁定脚本
+  int32  block_height = 3;  // 产出该 UTXO 的区块高度
+  uint32 packed_flags = 4;  // 位标志（tfCoinBase / tfSpent / tfModified / tfFresh）
+}
+
+
+message GetMainBlockByHeightReq {
+  int32 height = 1; // 区块高度
+}
+
+
+message GetAddressAllUtxoRequest {
+  string address = 1; // 待查询的地址（String类型，如比特币Base58/Bech32格式地址）
+}
+
+// 定义区块列表消息，用于GetAllBlock的返回
+message BlockList {
+  repeated ProtoMsgBlock blocks = 1; // 重复字段表示数组
+}
+
+// 定义UTXO列表消息，用于GetAllUTXO的返回
+message UtxoList {
+  repeated ProtoUtxoEntry utxos = 1; // 重复字段表示数组
+  int32  TotalCount = 2;
+  int64  TotalBalance = 3;
+}
+
+message SubmitTxRequest {
+  string json_data = 1; // 存储交易的 JSON 字符串
+}
+
+//请求头
+message BaseRequest {
+  string node_id = 1;        // 节点唯一标识（正式环境必填，测试环境可选）
+}
+
+// 通用返回包装
+message CommonResp {
+  int32     code       = 1; // 0 = success
+  string    message    = 2; // 错误详情
+  bytes     data       = 4; // 任意 protobuf 序列化后的 payload
+}
+
+// -------------------------- gRPC 请求/回复 DTO --------------------------
+// 获取区块请求 DTO（保持原结构）
+message GetBlockRequestDTO {
+  uint32 height = 1;            // 不变（区块高度）
+}
+
+// 获取区块回复 DTO（返回 DTO 版本的区块）
+message GetBlockReplyDTO {
+  ProtoMsgBlockDTO block = 1;   // 引用 DTO 版本的完整区块
+}
+
+// gRPC 请求 / 回复
+message GetBlockRequest {
+  uint32 height = 1;
+}
+message GetBlockReply {
+  ProtoMsgBlock block = 1;
+}
+
+message ProtoTx {
+  bytes  txid   = 1; // 32 字节大端哈希
+  ProtoMsgTx tx = 2; // protobuf 编码后的完整交易
+  int64  size   = 3; // 字节大小
+  int64  weight = 4; // weight
+  string fee    = 5; // 手续费（聪）
+}
+
+message ProtoTxDTO {
+  string txid = 1; // hex txid
+  ProtoMsgTxDTO tx = 2;
+  int64  size   = 3;
+  int64  weight = 4;
+  string fee    = 5;
+}
+
+message ProtoTxIn {
+  bytes prev_hash = 1;   // 32 bytes
+  uint32 prev_index = 2;
+  bytes script_sig = 3;
+  uint32 sequence = 4;
+  repeated bytes witness_stack = 5; // 新增
+}
+
+message ProtoTxOut {
+  int64 value = 1;
+  bytes pk_script = 2;
+}
+
+message ProtoMsgTx {
+  int32 version = 1;
+  repeated ProtoTxIn tx_in = 2;
+  repeated ProtoTxOut tx_out = 3;
+  uint32 lock_time = 4;
+}
+
+message ProtoOutPoint{
+  bytes  hash  = 1; // 32-byte previous txid
+  uint32 index = 2; // output index
+}
+
+// txoFlags 在 proto 里用 uint32 保存位标志
+message ProtoUtxoEntry {
+  int64  amount       = 1;  // 金额（聪）
+  bytes  pk_script    = 2;  // 锁定脚本
+  int32  block_height = 3;  // 产出该 UTXO 的区块高度
+  uint32 packed_flags = 4;  // 位标志（tfCoinBase / tfSpent / tfModified / tfFresh）
+}
+
+
+
+
+
+// 区块头部
+message ProtoBlockHeader {
+  int32  version    = 1;  // 4 字节
+  bytes  prev_block = 2;  // 32 字节
+  bytes  merkle_root = 3; // 32 字节
+  int64  timestamp  = 4;  // 8 字节
+  uint32 bits       = 5;  // 4 字节
+  uint32 nonce      = 6;  // 4 字节
+}
+
+//存储在数据库中的区块头
+message ProtoDbBlockHeader {
+  ProtoBlockHeader header       = 1;
+  bytes chain_work = 2;
+}
+
+//完整区块
+message ProtoMsgBlock {
+  ProtoBlockHeader header       = 1;
+  repeated ProtoMsgTx transactions = 2;
+}
+
+//区块体
+message ProtoMsgBlockBody {
+  bytes hash =2;
+  repeated ProtoMsgTx transactions = 1;
+}
+
+//完成「基础通信能力确认」和「关键元信息交换」，确保双方后续能高效、兼容地进行业务交互。
+//握手或者版本消息
+message ProtoHandshake{
+    int32 protocol_version =1;//节点使用的协议版本（如比特币的 70016）
+    repeated ServiceFlag services  =2;//节点支持的服务标识
+    int64  timestamp = 3;//消息生成时间戳 1. 检测异常节点（如时间戳偏差过大，可能是恶意节点）；2. 后续超时逻辑的基础（如 “多久没响应算断开”）
+    uint64 nonce = 4;//通信标识：检测自我连接（比如配置错误连到自己，收到相同的 Nonce 就断开），避免资源浪费
+    string user_agent = 5;//节点软件标识（如 Bitcoin Core 25.0.0）
+    bytes  genesis_hash = 6;//创世区块hash 可以从这里知道两条链的基本参数是否一致 创世区块的输出脚本信息有难度 出块时间等等信息
+    int32  last_block_height = 7;//状态对齐：快速判断同步方向（比如我是 1000 高度，对方是 1200，就知道要从它同步后续区块）
+    bool   disable_relay_tx = 8;//资源优化：轻节点可能不需要交易转发，避免给它发无效交易数据，节省带宽
+    int64 fee_filter  = 9;
+    bool witness_enabled = 10;
+
+    int32  latest_height = 11; //最新高度
+    bytes  latest_hash = 12; //最新hash
+
+}
+
+//回复时携带自己的节点信息
+message ProtoHandshakeAck{
+  ProtoHandshake handshake       = 1;
+}
+
+
+// -------------------------- 交易相关 DTO --------------------------
+// 交易输入 DTO（哈希字段转为 Hex 字符串）
+message ProtoTxInDTO {
+  string prev_hash = 1;        // 原 bytes → Hex 字符串（32字节哈希的十六进制表示）
+  uint32 prev_index = 2;       // 不变
+  string script_sig = 3;        // 脚本保持二进制（通常无需人类可读）
+  uint32 sequence = 4;         // 不变
+  repeated bytes witness_stack = 5; // 见证数据保持二进制（特殊场景使用）
+}
+
+// 交易输出 DTO（无需改哈希，保持原结构）
+message ProtoTxOutDTO {
+  int64 value = 1;             // 不变（金额，单位：聪）
+  string pk_script = 2;         // 锁定脚本保持二进制
+}
+
+// 完整交易 DTO
+message ProtoMsgTxDTO {
+  int32 version = 1;           // 不变
+  repeated ProtoTxInDTO tx_in = 2; // 引用 DTO 版本的交易输入
+  repeated ProtoTxOutDTO tx_out = 3; // 引用 DTO 版本的交易输出
+  uint32 lock_time = 4;        // 不变
+}
+
+// 交易引用点 DTO（哈希字段转为 Hex 字符串）
+message ProtoOutPointDTO {
+  string hash = 1;             // 原 bytes → Hex 字符串（32字节交易哈希）
+  uint32 index = 2;            // 不变（输出索引）
+}
+
+
+// -------------------------- UTXO 相关 DTO --------------------------
+// UTXO 条目 DTO（保持原结构，脚本无需转 Hex）
+message ProtoUtxoEntryDTO {
+  int64  amount = 1;           // 不变（金额，单位：聪）
+  bytes  pk_script = 2;        // 锁定脚本保持二进制
+  int32  block_height = 3;     // 不变（产出区块高度）
+  uint32 packed_flags = 4;     // 不变（位标志）
+}
+
+
+// -------------------------- 区块相关 DTO --------------------------
+// 区块头 DTO（哈希字段转为 Hex 字符串）
+message ProtoBlockHeaderDTO {
+  int32  version = 1;          // 不变
+  string prev_block = 2;       // 原 bytes → Hex 字符串（前区块哈希）
+  string merkle_root = 3;      // 原 bytes → Hex 字符串（默克尔根哈希）
+  int64  timestamp = 4;        // 不变（时间戳）
+  uint32 bits = 5;             // 不变（难度值）
+  uint32 nonce = 6;            // 不变（随机数）
+}
+
+// 完整区块 DTO
+message ProtoMsgBlockDTO {
+  ProtoBlockHeaderDTO header = 1; // 引用 DTO 版本的区块头
+  repeated ProtoMsgTxDTO transactions = 2; // 引用 DTO 版本的交易列表
+}
+
+// 区块体 DTO
+message ProtoMsgBlockBodyDTO {
+  repeated ProtoMsgTxDTO transactions = 1; // 引用 DTO 版本的交易列表
+}
+
+
+
+// 统一消息帧
+message Message {
+  int32  type      = 1;   // 枚举：1 = handshake，2 = ack ...
+  bool   need_reply = 2;  // 是否需要对方回复
+  uint64 req_id     = 3;  // 随机 id，用于匹配请求/响应
+  bytes  body       = 4;  // 业务负载
+}
+
+// 握手消息示例（body 可对应此结构）
+message Handshake {
+  int32  protocol_version = 1;
+  bytes  genesis_hash     = 2;
+  int64  latest_height    = 3;
+  bytes  latest_hash      = 4;
+  string peer_id          = 5;
+}
+
+message Ack {
+  uint64 echo_req_id = 1; // 回显原 req_id
+  bytes  payload     = 2; // 可选附加数据
+}
+
+// 表示32字节的哈希（与你的Hash类型对应）
+message ProtoHash {
+  bytes value = 1; // 存储哈希的原始字节（长度固定为32）
+}
+
+// 哈希集合（对应Go中的map[Hash]struct{}）
+message ProtoHashSet {
+  repeated ProtoHash hashes = 1; // 用repeated存储多个哈希（集合去重逻辑在代码中处理）
+}
+
+
+// 定义库存向量类型（对应InvType）
+enum InvType {
+  INV_TYPE_ERROR = 0;                  // 错误类型（对应Go的InvTypeError）
+  INV_TYPE_TX = 1;                     // 普通交易（对应Go的InvTypeTx）
+  INV_TYPE_BLOCK = 2;                  // 普通区块（对应Go的InvTypeBlock）
+  INV_TYPE_FILTERED_BLOCK = 3;         // 过滤区块（对应Go的InvTypeFilteredBlock）
+  INV_TYPE_WITNESS_TX = 1073741825;    // 带见证数据的交易（1 | 1<<30，对应Go的InvTypeWitnessTx）
+  INV_TYPE_WITNESS_BLOCK = 1073741826; // 带见证数据的区块（2 | 1<<30，对应Go的InvTypeWitnessBlock）
+  INV_TYPE_FILTERED_WITNESS_BLOCK = 1073741827; // 带见证数据的过滤区块（3 | 1<<30，对应Go的InvTypeFilteredWitnessBlock）
+}
+
+// 库存向量结构体（对应InvVect）
+message ProtoInvVect {
+  InvType type = 1;      // 数据类型
+  bytes hash = 2;        // 数据哈希（对应chainhash.Hash的字节形式）
+}
+
+message ProtoRelayMsg {
+  ProtoInvVect invVect = 1;
+  bytes  data     = 2;
+}

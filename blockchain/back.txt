@@ -1,0 +1,1701 @@
+func (b *BlockChain) ApplyToMainChainBack(block *core.Block) error {
+	log.Infof("应用到主链")
+	// 准备UTXO视图
+	utxoView := NewUtxoViewpoint()
+	if err := utxoView.fetchInputUtxos(b.utxoCache, block); err != nil {
+		return fmt.Errorf("加载UTXO失败：%w", err)
+	}
+
+	blockHeight := block.Height()
+	var spentTxOuts []SpentTxOut
+	// 记录需要删除的地址索引信息
+	var indexesToDelete []struct {
+		OutPoint core.OutPoint
+		PkScript []byte
+	}
+
+	transactions := block.Transactions()
+	for _, tx := range transactions {
+		fmt.Printf("交易ID: %s\n", tx.Hash())
+		msgTx := tx.MsgTx()
+		isCoinBase := IsCoinBase(tx)
+
+		// 处理普通交易的输入（消耗UTXO）
+		if !isCoinBase {
+			for _, txIn := range msgTx.TxIn {
+				outPoint := txIn.PreviousOutPoint
+				utxoEntry := utxoView.LookupEntry(outPoint)
+				if utxoEntry == nil || utxoEntry.IsSpent() {
+					return fmt.Errorf("tx %s input: UTXO not found or already spent", tx.Hash().String())
+				}
+
+				// 记录回滚数据
+				spentTxOuts = append(spentTxOuts, SpentTxOut{
+					Amount:     utxoEntry.Amount(),
+					PkScript:   utxoEntry.PkScript(),
+					Height:     utxoEntry.BlockHeight(),
+					IsCoinBase: utxoEntry.IsCoinBase(),
+				})
+
+				// 单独记录需要删除的索引信息
+				indexesToDelete = append(indexesToDelete, struct {
+					OutPoint core.OutPoint
+					PkScript []byte
+				}{
+					OutPoint: outPoint,
+					PkScript: utxoEntry.PkScript(),
+				})
+
+				utxoEntry.Spend()
+			}
+		}
+
+		// 处理所有交易的输出（创建新UTXO）
+		utxoView.AddTxOuts(tx, blockHeight)
+	}
+
+	// 原子化持久化所有变更
+	err := b.db.Update(func(batch db.IndexedBatch) error {
+		// 处理UTXO变更及地址索引
+		for outPoint, entry := range utxoView.Entries() {
+			if !entry.isModified() {
+				continue
+			}
+			utxoKey := b.UTXOKey(outPoint.Hash, outPoint.Index)
+			if entry.IsSpent() {
+				// 删除已花费UTXO记录
+				if err := batch.Delete(utxoKey); err != nil {
+					return fmt.Errorf("删除已花费UTXO失败 (outpoint %v): %w", outPoint, err)
+				}
+				// 查找并删除对应的地址索引
+				for _, idx := range indexesToDelete {
+					if idx.OutPoint == outPoint {
+						// 从脚本中解析地址
+						_, addrs, _, err := txscript.ExtractPkScriptAddrs(idx.PkScript, b.chainParams)
+						if err != nil {
+							continue
+						}
+						// 删除每个关联地址的索引
+						for _, addr := range addrs {
+							addrIndexKey := b.addrIndexKey(addr.EncodeAddress(), outPoint.Hash, outPoint.Index)
+							if err := batch.Delete(addrIndexKey); err != nil {
+								return fmt.Errorf("删除地址索引失败 (addr %s, outpoint %v): %w",
+									addr.EncodeAddress(), outPoint, err)
+							}
+						}
+						break
+					}
+				}
+			} else {
+				// 保存新UTXO记录
+				protoUtxo, err2 := entry.ToProto()
+				if err2 != nil {
+					return err2
+				}
+
+				utxoBytes, err := proto.Marshal(protoUtxo)
+				if err != nil {
+					return fmt.Errorf("序列化UTXO失败 (outpoint %v): %w", outPoint, err)
+				}
+
+				if err := batch.Put(utxoKey, utxoBytes); err != nil {
+					return fmt.Errorf("保存新UTXO失败 (outpoint %v): %w", outPoint, err)
+				}
+
+				// 为新UTXO创建地址索引
+				for _, tx := range transactions {
+					if *tx.Hash() != outPoint.Hash {
+						continue
+					}
+
+					msgTx := tx.MsgTx()
+					if int(outPoint.Index) >= len(msgTx.TxOut) {
+						continue
+					}
+
+					txOut := msgTx.TxOut[outPoint.Index]
+					_, addrs, _, err := txscript.ExtractPkScriptAddrs(txOut.PkScript, b.chainParams)
+					if err != nil {
+						continue
+					}
+					for _, addr := range addrs {
+						addrIndexKey := b.addrIndexKey(addr.EncodeAddress(), outPoint.Hash, outPoint.Index)
+						amountBytes := serializeAmount(txOut.Value) // txOut.Value即当前UTXO的金额
+						if err := batch.Put(addrIndexKey, amountBytes); err != nil {
+							return fmt.Errorf("创建地址索引失败 (addr %s, outpoint %v): %w",
+								addr.EncodeAddress(), outPoint, err)
+						}
+					}
+					break
+				}
+			}
+		}
+
+		err := b.indexManager.ConnectBlock(block, spentTxOuts)
+		if err != nil {
+			return fmt.Errorf("索引创建失败")
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("数据库事务失败: %w", err)
+	}
+
+	// 连接所有交易
+	if err := utxoView.connectTransactions(block, &spentTxOuts); err != nil {
+		return fmt.Errorf("连接交易失败: %w", err)
+	}
+
+	// 提交UTXO视图
+	utxoView.commit()
+	return nil
+}
+
+
+func (b *BlockChain) SaveBlock(block *core.Block) error {
+	blockHash := block.Hash()
+	header := block.GetHeader()
+	body := block.GetBody()
+	height := block.BlockHeight
+
+	// 获取区块中的所有交易
+	transactions := block.Transactions()
+	workAmount := body.ChainWork()
+
+	// 使用数据库的Update方法创建一个事务，确保所有操作原子性提交
+	return b.db.Update(func(batch db.IndexedBatch) error {
+		// 1. 序列化并保存区块头到事务中
+		protoHeader := header.ToProto()
+		headerBytes, err := proto.Marshal(protoHeader)
+		if err != nil {
+			return fmt.Errorf("序列化区块头失败: %w", err)
+		}
+		headerKey := db.BlockHeaderBucket.Key(blockHash[:])
+		if err := batch.Put(headerKey, headerBytes); err != nil {
+			return fmt.Errorf("保存区块头到事务失败: %w", err)
+		}
+
+		// 2. 序列化并保存区块体到事务中
+		protoBody := body.ToProto()
+		bodyBytes, err := proto.Marshal(protoBody)
+		if err != nil {
+			return fmt.Errorf("序列化区块体失败: %w", err)
+		}
+		bodyKey := db.BlockBodyBucket.Key(blockHash[:])
+		if err := batch.Put(bodyKey, bodyBytes); err != nil {
+			return fmt.Errorf("保存区块体到事务失败: %w", err)
+		}
+		// 3. 为每笔交易创建交易ID到区块Hash的索引 和交易 位置 key是交易ID  value是 区块Hash和交易所在的位置
+		for _, tx := range transactions {
+			// 获取交易ID
+			txID := tx.MsgTx().TxHash() // 假设交易对象有此方法获取交易ID
+
+			// 创建索引键 (交易ID桶 + 交易ID)
+			txKey := db.TxToBlockBucket.Key(txID[:])
+
+			// 保存交易ID到区块Hash的映射
+			if err := batch.Put(txKey, blockHash[:]); err != nil {
+				return fmt.Errorf("保存交易ID到区块Hash索引失败: %w", err)
+			}
+		}
+
+		// 4. 新增：保存区块Hash到工作总量（big.Int）的映射
+		// 4.1 big.Int 转字节切片（使用内置Bytes()方法，适合存储）
+		workBytes := workAmount.Bytes() // 序列化big.Int为字节切片
+
+		// 4.2 生成存储键（假设存在HashToWorkBucket桶）
+		workKey := db.HashToChinaWork.Key(blockHash[:])
+
+		// 4.3 保存到事务
+		if err := batch.Put(workKey, workBytes); err != nil {
+			return fmt.Errorf("保存工作总量映射失败: %w", err)
+		}
+
+		//建立区块Hash到高度的索引 HashToHeight
+		heightKey := db.HashToHeight.Key(blockHash[:])
+		if err := batch.Put(heightKey, Int32ToBytes(height)); err != nil {
+			return fmt.Errorf("保存区块体到事务失败: %w", err)
+		}
+
+		return nil
+	})
+}
+
+
+
+
+
+
+package blockchain
+
+import (
+	"bitcoin/chaincfg/chainhash"
+	"bitcoin/core"
+	"bitcoin/db"
+	"bitcoin/wire"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"google.golang.org/protobuf/proto"
+	"math/big"
+)
+
+// 桶是 MainStatus key是MainLatestHash
+// GetMainLatestHash 获取主链最新区块的哈希值
+func (b *BlockChain) GetMainLatestHash() (chainhash.Hash, error) {
+	// 1. 构造查询键：MainStatus桶 + MainLatestHash键
+	// 假设存在db.MainStatusBucket（主链状态桶）和db.MainLatestHashKey（最新哈希键）的定义
+	key := db.MainStatus.Key([]byte(db.MainLatestHash))
+
+	var hashBytes []byte
+	// 2. 从数据库读取最新哈希的字节数据
+	err := b.db.Get(key, func(value []byte) error {
+		if value == nil {
+			return db.ErrKeyNotFound // 键不存在，返回未找到错误
+		}
+		// 验证哈希长度是否符合标准（通常为32字节）
+		if len(value) != chainhash.HashSize {
+			return fmt.Errorf("invalid latest hash length: got %d, expected %d",
+				len(value), chainhash.HashSize)
+		}
+		// 复制数据到外部变量
+		hashBytes = make([]byte, len(value))
+		copy(hashBytes, value)
+		return nil
+	})
+	// 处理数据库操作错误
+	if err != nil {
+		return chainhash.Hash{}, fmt.Errorf("获取主链最新哈希失败: %w", err)
+	}
+	// 3. 将字节数据转换为chainhash.Hash类型
+	var latestHash chainhash.Hash
+	copy(latestHash[:], hashBytes)
+
+	return latestHash, nil
+}
+
+// 桶是 MainStatus key是MainLatestHeight
+// GetMainLatestHeight 获取主链最新区块的高度
+func (b *BlockChain) GetMainLatestHeight() (int32, error) {
+	// 1. 构造查询键：MainStatus桶 + MainLatestHeight键（字符串转字节）
+	key := db.MainStatus.Key([]byte(db.MainLatestHeight))
+
+	var heightBytes []byte
+	// 2. 从数据库读取最新高度的字节数据
+	err := b.db.Get(key, func(value []byte) error {
+		if value == nil {
+			return db.ErrKeyNotFound // 键不存在，返回未找到错误
+		}
+		// 验证高度字节长度是否符合int32（4字节）
+		if len(value) != 4 {
+			return fmt.Errorf("invalid latest height length: got %d, expected 4", len(value))
+		}
+		// 复制数据到外部变量
+		heightBytes = make([]byte, len(value))
+		copy(heightBytes, value)
+		return nil
+	})
+
+	// 处理数据库操作错误
+	if err != nil {
+		return 0, fmt.Errorf("获取主链最新高度失败: %w", err)
+	}
+
+	// 3. 将4字节数据转换为int32（注意字节序，区块链中通常用小端序）
+	// 若系统中存储时用大端序，可替换为binary.BigEndian
+	height := int32(binary.LittleEndian.Uint32(heightBytes))
+
+	return height, nil
+}
+
+// GetBlockChainWorkByHash 根据区块哈希获取对应的工作总量（big.Int类型）
+func (b *BlockChain) GetBlockChainWorkByHash(hash chainhash.Hash) (*big.Int, error) {
+	// 1. 构造查询键：HashToChinaWork桶 + 区块哈希（与保存时的键规则一致）
+	key := db.HashToChinaWork.Key(hash[:])
+
+	var workBytes []byte
+	// 2. 从数据库读取工作总量的字节数据
+	err := b.db.Get(key, func(value []byte) error {
+		if value == nil {
+			return db.ErrKeyNotFound // 键不存在，返回未找到错误
+		}
+		// 复制数据到外部变量（避免引用数据库内部的临时切片）
+		workBytes = make([]byte, len(value))
+		copy(workBytes, value)
+		return nil
+	})
+
+	// 3. 处理数据库操作错误
+	if err != nil {
+		return nil, fmt.Errorf("获取区块工作总量失败: %w", err)
+	}
+
+	// 4. 将字节切片转换为big.Int类型
+	workAmount := new(big.Int).SetBytes(workBytes)
+	return workAmount, nil
+}
+
+// hash->区块头
+// hash->区块体
+// 交易ID -> Hash
+func (b *BlockChain) SaveBlock(block *core.Block) error {
+	blockHash := block.Hash()
+	header := block.GetHeader()
+	body := block.GetBody()
+	height := block.BlockHeight
+	workAmount := body.ChainWork()
+
+	// 使用数据库的Update方法创建一个事务，确保所有操作原子性提交
+	return b.db.Update(func(batch db.IndexedBatch) error {
+		// 1. 序列化并保存区块头到事务中
+		protoHeader := header.ToProto()
+		headerBytes, err := proto.Marshal(protoHeader)
+		if err != nil {
+			return fmt.Errorf("序列化区块头失败: %w", err)
+		}
+		headerKey := db.BlockHeaderBucket.Key(blockHash[:])
+		if err := batch.Put(headerKey, headerBytes); err != nil {
+			return fmt.Errorf("保存区块头到事务失败: %w", err)
+		}
+
+		// 2. 序列化并保存区块体到事务中
+		protoBody := body.ToProto()
+		bodyBytes, err := proto.Marshal(protoBody)
+		if err != nil {
+			return fmt.Errorf("序列化区块体失败: %w", err)
+		}
+		bodyKey := db.BlockBodyBucket.Key(blockHash[:])
+		if err := batch.Put(bodyKey, bodyBytes); err != nil {
+			return fmt.Errorf("保存区块体到事务失败: %w", err)
+		}
+
+		// 4. 新增：保存区块Hash到工作总量（big.Int）的映射
+		// 4.1 big.Int 转字节切片（使用内置Bytes()方法，适合存储）
+		workBytes := workAmount.Bytes() // 序列化big.Int为字节切片
+
+		// 4.2 生成存储键（假设存在HashToWorkBucket桶）
+		workKey := db.HashToChinaWork.Key(blockHash[:])
+
+		// 4.3 保存到事务
+		if err := batch.Put(workKey, workBytes); err != nil {
+			return fmt.Errorf("保存工作总量映射失败: %w", err)
+		}
+
+		//建立区块Hash到高度的索引 HashToHeight
+		heightKey := db.HashToHeight.Key(blockHash[:])
+		if err := batch.Put(heightKey, Int32ToBytes(height)); err != nil {
+			return fmt.Errorf("保存区块体到事务失败: %w", err)
+		}
+
+		return nil
+	})
+}
+
+// Int32ToBytes 将int32类型转换为[]byte（小端序）
+// 区块链场景中常用小端序存储整数，与本项目中其他高度/索引的存储逻辑保持一致
+func Int32ToBytes(n int32) []byte {
+	buf := make([]byte, 4) // int32固定占4字节
+	binary.LittleEndian.PutUint32(buf, uint32(n))
+	return buf
+}
+
+// BytesToInt32 将[]byte转换为int32类型（小端序）
+// 要求输入字节切片长度必须为4，否则返回错误
+func BytesToInt32(b []byte) (int32, error) {
+	if len(b) != 4 {
+		return 0, errors.New("字节切片长度必须为4")
+	}
+	// 先将字节切片转换为uint32，再转换为int32
+	return int32(binary.LittleEndian.Uint32(b)), nil
+}
+
+// 高度到Hash
+// 主链最新高度
+// 主链最新区块Hash
+// 主链最新累计工作量
+func (b *BlockChain) UpdateMainChain(hash *chainhash.Hash, work *big.Int, height int32) error {
+	// 1. 参数合法性校验（避免无效输入导致的后续存储错误）
+	if hash == nil {
+		return fmt.Errorf("invalid parameter: hash is nil")
+	}
+	if work == nil {
+		return fmt.Errorf("invalid parameter: work is nil")
+	}
+	// 高度通常非负（创世区块高度为0），可根据业务需求补充校验
+	if height < 0 {
+		return fmt.Errorf("invalid parameter: height is negative (%d)", height)
+	}
+
+	// 2. 使用数据库事务（IndexedBatch）保证原子性：所有更新操作要么全成功，要么全回滚
+	return b.db.Update(func(batch db.IndexedBatch) error {
+		// 2.1 更新主链最新区块哈希（Key: MainStatus桶 + MainLatestHash键；Value: 32字节哈希）
+		latestHashKey := db.MainStatus.Key([]byte(db.MainLatestHash))
+		if err := batch.Put(latestHashKey, hash[:]); err != nil {
+			return fmt.Errorf("failed to update latest block hash: %w", err)
+		}
+
+		// 2.2 更新主链最新区块高度（Key: MainStatus桶 + MainLatestHeight键；Value: 4字节小端序）
+		latestHeightKey := db.MainStatus.Key([]byte(db.MainLatestHeight))
+		heightBytes := make([]byte, 4)                             // int32 固定占4字节
+		binary.LittleEndian.PutUint32(heightBytes, uint32(height)) // 与读取逻辑（GetMainLatestHeight）保持字节序一致
+		if err := batch.Put(latestHeightKey, heightBytes); err != nil {
+			return fmt.Errorf("failed to update latest block height: %w", err)
+		}
+
+		// 2.3 更新主链最新累计工作量（Key: MainStatus桶 + MainLatestWork键；Value: big.Int字节切片）
+		// 假设 db 包已定义常量 MainLatestWork = "main_latest_work"（需与业务定义保持一致）
+		latestWorkKey := db.MainStatus.Key([]byte(db.MainLatestWork))
+		workBytes := work.Bytes() // big.Int 内置序列化方法，适合存储
+		if err := batch.Put(latestWorkKey, workBytes); err != nil {
+			return fmt.Errorf("failed to update latest chain work: %w", err)
+		}
+
+		// ---------------------- 新增：高度到Hash的索引 ----------------------
+		// 作用：建立主链区块高度与区块哈希的映射，支持通过高度快速查询哈希
+		// 存储规则：
+		// - 桶：db.HeightToBlockBucket（专门存储「高度→哈希」映射的桶，需提前定义）
+		// - 键：int32类型的高度（转换为4字节小端序，与读取逻辑保持一致）
+		// - 值：32字节的区块哈希（chainhash.Hash的底层字节切片）
+		// 1. 构造索引键：高度桶 + 高度的字节形式
+		heightToHashKey := db.HeightToBlockBucket.Int32Key(height)
+		// 2. 写入索引：键=高度字节，值=区块哈希字节
+		if err := batch.Put(heightToHashKey, hash[:]); err != nil {
+			return fmt.Errorf("failed to save height-to-hash index (height: %d): %w", height, err)
+		}
+
+		// 3. 事务内所有操作成功，返回nil触发提交
+		return nil
+	})
+}
+
+// GetMainBlockHashByHeight 根据高度获取主链上对应区块的哈希值
+func (b *BlockChain) GetMainBlockHashByHeight(height int32) (chainhash.Hash, error) {
+	// 1. 生成数据库查询键：高度到区块哈希的映射桶 + int32类型的高度
+	key := db.HeightToBlockBucket.Int32Key(height)
+
+	var hashBytes []byte
+	// 2. 从数据库读取对应高度的区块哈希字节数据
+	err := b.db.Get(key, func(value []byte) error {
+		if value == nil {
+			return db.ErrKeyNotFound // 键不存在，返回未找到错误
+		}
+		// 验证哈希长度是否符合标准（32字节）
+		if len(value) != chainhash.HashSize {
+			return fmt.Errorf("invalid hash length: got %d, expected %d",
+				len(value), chainhash.HashSize)
+		}
+		// 复制数据到外部变量（避免引用数据库内部临时切片）
+		hashBytes = make([]byte, len(value))
+		copy(hashBytes, value)
+		return nil
+	})
+
+	// 3. 处理数据库操作错误
+	if err != nil {
+		return chainhash.Hash{}, fmt.Errorf("获取高度 %d 对应的主链区块哈希失败: %w", height, err)
+	}
+
+	// 4. 将字节数据转换为chainhash.Hash类型并返回
+	var blockHash chainhash.Hash
+	copy(blockHash[:], hashBytes)
+	return blockHash, nil
+}
+
+func (b *BlockChain) GetBlockHeader(hash []byte) (*core.BlockHeader, error) {
+	// 1. 生成带Bucket的key（与保存时保持一致）
+	key := db.BlockHeaderBucket.Key(hash)
+
+	// 2. 从数据库读取数据
+	var headerBytes []byte
+	err := b.db.Get(key, func(value []byte) error {
+		// 仅当值存在时复制数据，不存在时不做处理（headerBytes保持nil）
+		if value != nil {
+			headerBytes = make([]byte, len(value))
+			copy(headerBytes, value)
+		}
+		return nil // 不返回key不存在的错误
+	})
+	// 处理数据库操作本身的错误（非key不存在的情况）
+	if err != nil {
+		return nil, fmt.Errorf("获取区块头失败: %w", err)
+	}
+
+	// 3. 若未读取到数据（未找到），直接返回nil
+	if headerBytes == nil {
+		return nil, nil
+	}
+
+	// 4. 反序列化为proto对象
+	var protoHeader wire.ProtoBlockHeader
+	if err := proto.Unmarshal(headerBytes, &protoHeader); err != nil {
+		return nil, fmt.Errorf("反序列化区块头失败: %w", err)
+	}
+
+	// 5. 转换为BlockHeader对象并返回
+	header := &core.BlockHeader{}
+	header.FromProto(&protoHeader)
+	return header, nil
+}
+
+func (b *BlockChain) MainChainGetHashByHeight(height int64) (*chainhash.Hash, error) {
+	// 生成数据库查询键（高度对应桶+int64类型高度）
+	key := db.HeightToBlockBucket.Int64Key(height)
+	var val []byte
+	// 从数据库获取值
+	if err := b.db.Get(key, func(v []byte) error {
+		if v == nil {
+			return db.ErrKeyNotFound
+		}
+		// 验证哈希长度是否符合要求（通常区块链哈希为32字节）
+		if len(v) != chainhash.HashSize {
+			return fmt.Errorf("invalid hash length: got %d, expected %d", len(v), chainhash.HashSize)
+		}
+		// 复制数据到外部变量
+		val = make([]byte, len(v))
+		copy(val, v)
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("根据主链高度查询Hash失败: %w", err)
+	}
+	// 将字节切片转换为chainhash.Hash类型
+	hash, err := chainhash.NewHash(val)
+	if err != nil {
+		return nil, fmt.Errorf("哈希转换失败: %w", err)
+	}
+	return hash, nil
+}
+
+// 高度到Hash
+func (b *BlockChain) MainChainGetHashByHeightInit32(keyValue int32) (*chainhash.Hash, error) {
+	// 生成数据库查询键（使用int32类型的值）
+	key := db.HeightToBlockBucket.Int32Key(keyValue)
+	var val []byte
+
+	// 从数据库获取值
+	if err := b.db.Get(key, func(v []byte) error {
+		if v == nil {
+			return db.ErrKeyNotFound
+		}
+
+		// 验证哈希长度是否符合要求
+		if len(v) != chainhash.HashSize {
+			return fmt.Errorf("invalid hash length: got %d, expected %d", len(v), chainhash.HashSize)
+		}
+
+		// 复制数据到外部变量
+		val = make([]byte, len(v))
+		copy(val, v)
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("根据int32键查询Hash失败: %w", err)
+	}
+
+	// 将字节切片转换为chainhash.Hash类型
+	hash, err := chainhash.NewHash(val)
+	if err != nil {
+		return nil, fmt.Errorf("哈希转换失败: %w", err)
+	}
+
+	return hash, nil
+}
+
+// GetAllBlock 遍历主链所有区块，返回完整的 MsgBlock 列表（按高度升序排列）
+// 实现逻辑：通过高度索引（height→hash）遍历，再通过 hash 查区块头和区块体，最终组装为 MsgBlock
+func (b *BlockChain) GetAllBlock() ([]*core.MsgBlock, error) {
+	// 1. 获取主链最新高度，确定遍历边界（从 0 到 latestHeight 全覆盖）
+	latestHeight, err := b.GetMainLatestHeight()
+	if err != nil {
+		return nil, fmt.Errorf("获取主链最新高度失败: %w", err)
+	}
+
+	// 预分配切片容量（创世区块高度为 0，共 latestHeight+1 个区块），提升性能
+	msgBlocks := make([]*core.MsgBlock, 0, latestHeight+1)
+
+	// 2. 按高度升序遍历（从 0 到最新高度）
+	for height := int32(0); height <= latestHeight; height++ {
+		// 2.1 根据高度获取对应区块的哈希（依赖「高度→哈希」索引）
+		blockHash, err := b.MainChainGetHashByHeightInit32(height)
+		if err != nil {
+			return nil, fmt.Errorf("高度 %d 对应的哈希获取失败: %w", height, err)
+		}
+
+		// 2.2 根据哈希获取区块头（复用已有 GetBlockHeader 方法）
+		header, err := b.GetBlockHeader(blockHash[:])
+		if err != nil {
+			return nil, fmt.Errorf("哈希 %s（高度 %d）的区块头获取失败: %w", blockHash, height, err)
+		}
+		if header == nil {
+			return nil, fmt.Errorf("哈希 %s（高度 %d）的区块头不存在", blockHash, height)
+		}
+
+		// 2.3 根据哈希获取区块体（需逆序实现 SaveBlock 中的区块体存储逻辑）
+		bodyKey := db.BlockBodyBucket.Key(blockHash[:]) // 构造区块体存储键
+		var bodyBytes []byte
+
+		// 从数据库读取区块体字节数据
+		err = b.db.Get(bodyKey, func(value []byte) error {
+			if value == nil {
+				return db.ErrKeyNotFound
+			}
+			// 复制数据避免引用数据库临时切片
+			bodyBytes = make([]byte, len(value))
+			copy(bodyBytes, value)
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("哈希 %s（高度 %d）的区块体读取失败: %w", blockHash, height, err)
+		}
+		if bodyBytes == nil {
+			return nil, fmt.Errorf("哈希 %s（高度 %d）的区块体不存在", blockHash, height)
+		}
+
+		// 2.4 区块体反序列化（Proto → core.BlockBody）
+		var protoBody wire.ProtoMsgBlockBody
+		if err := proto.Unmarshal(bodyBytes, &protoBody); err != nil {
+			return nil, fmt.Errorf("哈希 %s（高度 %d）的区块体反序列化失败: %w", blockHash, height, err)
+		}
+
+		// 转换为业务层的 BlockBody（假设 core.BlockBody 实现了 FromProto 方法，与 BlockHeader 保持一致）
+		body := &core.MsgBlockBody{}
+		if err := body.FromProto(&protoBody); err != nil {
+			return nil, fmt.Errorf("哈希 %s（高度 %d）的区块体格式转换失败: %w", blockHash, height, err)
+		}
+
+		// 2.5 组装完整 MsgBlock（需贴合 core.MsgBlock 的结构定义）
+		// 核心：拼接区块头 + 区块内交易（从 BlockBody 中提取）
+
+		msgBlock := &core.MsgBlock{
+			Header:       *header,
+			Transactions: body.GetTransactions(), // 假设 BlockBody 有 Transactions() 方法返回交易列表
+		}
+
+		/*		block := core.NewBlock(msgBlock)
+
+				// 可选：显式设置区块哈希（部分实现中 MsgBlock.Hash() 需计算，此处直接复用已获取的哈希）
+				if err := msgBlock.SetHash(blockHash); err != nil { // 若 core.MsgBlock 支持 SetHash 方法
+					return nil, fmt.Errorf("哈希 %s（高度 %d）的 MsgBlock 哈希设置失败: %w", blockHash, height, err)
+				}*/
+
+		// 2.6 将组装好的区块加入结果列表
+		msgBlocks = append(msgBlocks, msgBlock)
+	}
+
+	// 3. 遍历完成，返回升序区块列表
+	return msgBlocks, nil
+}
+
+// GetAllBlockPaginated 分页查询所有区块
+// pageIndex: 页码索引，从0开始
+// pageSize: 每页包含的区块数量
+func (b *BlockChain) GetAllBlockPaginated(pageIndex, pageSize int32) ([]*core.MsgBlock, int32, error) {
+	// 1. 参数合法性校验
+	if pageIndex < 0 {
+		return nil, 0, fmt.Errorf("无效的页码索引: %d（必须是非负数）", pageIndex)
+	}
+	if pageSize <= 0 {
+		return nil, 0, fmt.Errorf("无效的分页大小: %d（必须是正数）", pageSize)
+	}
+
+	// 2. 获取主链最新高度，确定总页数和查询范围
+	latestHeight, err := b.GetMainLatestHeight()
+	if err != nil {
+		return nil, 0, fmt.Errorf("获取主链最新高度失败: %w", err)
+	}
+
+	// 计算总区块数量（创世区块高度为0）
+	totalBlocks := latestHeight + 1
+	if totalBlocks <= 0 {
+		return []*core.MsgBlock{}, 0, nil // 没有区块数据
+	}
+
+	// 3. 计算当前页的起始高度和结束高度
+	startHeight := pageIndex * pageSize
+	if startHeight >= totalBlocks {
+		return []*core.MsgBlock{}, totalBlocks, nil // 页码超出范围，返回空列表
+	}
+
+	// 结束高度 = 起始高度 + 分页大小 - 1（确保不超过最大高度）
+	endHeight := startHeight + pageSize - 1
+	if endHeight > latestHeight {
+		endHeight = latestHeight
+	}
+
+	// 4. 预分配切片容量（当前页实际可能的区块数量）
+	pageBlockCount := endHeight - startHeight + 1
+	msgBlocks := make([]*core.MsgBlock, 0, pageBlockCount)
+
+	// 5. 遍历当前页范围内的区块高度
+	for height := startHeight; height <= endHeight; height++ {
+		// 5.1 根据高度获取对应区块的哈希（依赖「高度→哈希」索引）
+		blockHash, err := b.MainChainGetHashByHeightInit32(height)
+		if err != nil {
+			return nil, totalBlocks, fmt.Errorf("高度 %d 对应的哈希获取失败: %w", height, err)
+		}
+
+		// 5.2 根据哈希获取区块头
+		header, err := b.GetBlockHeader(blockHash[:])
+		if err != nil {
+			return nil, totalBlocks, fmt.Errorf("哈希 %s（高度 %d）的区块头获取失败: %w", blockHash, height, err)
+		}
+		if header == nil {
+			return nil, totalBlocks, fmt.Errorf("哈希 %s（高度 %d）的区块头不存在", blockHash, height)
+		}
+
+		// 5.3 根据哈希获取区块体
+		bodyKey := db.BlockBodyBucket.Key(blockHash[:])
+		var bodyBytes []byte
+
+		err = b.db.Get(bodyKey, func(value []byte) error {
+			if value == nil {
+				return db.ErrKeyNotFound
+			}
+			bodyBytes = make([]byte, len(value))
+			copy(bodyBytes, value)
+			return nil
+		})
+		if err != nil {
+			return nil, totalBlocks, fmt.Errorf("哈希 %s（高度 %d）的区块体读取失败: %w", blockHash, height, err)
+		}
+		if bodyBytes == nil {
+			return nil, totalBlocks, fmt.Errorf("哈希 %s（高度 %d）的区块体不存在", blockHash, height)
+		}
+
+		// 5.4 区块体反序列化
+		var protoBody wire.ProtoMsgBlockBody
+		if err := proto.Unmarshal(bodyBytes, &protoBody); err != nil {
+			return nil, totalBlocks, fmt.Errorf("哈希 %s（高度 %d）的区块体反序列化失败: %w", blockHash, height, err)
+		}
+
+		// 转换为业务层的BlockBody
+		body := &core.MsgBlockBody{}
+		if err := body.FromProto(&protoBody); err != nil {
+			return nil, totalBlocks, fmt.Errorf("哈希 %s（高度 %d）的区块体格式转换失败: %w", blockHash, height, err)
+		}
+
+		// 5.5 组装完整MsgBlock
+		msgBlock := &core.MsgBlock{
+			Header:       *header,
+			Transactions: body.GetTransactions(),
+		}
+
+		// 5.6 将区块加入结果列表
+		msgBlocks = append(msgBlocks, msgBlock)
+	}
+
+	// 6. 返回当前页区块列表和总区块数
+	return msgBlocks, totalBlocks, nil
+}
+
+// GetAllUTXO 遍历数据库中所有UTXO（含已花费和未花费），返回完整UTXO列表
+// 若需筛选「未花费」UTXO，可在遍历中添加 IsSpent == false 的过滤逻辑
+// GetAllUTXO 遍历数据库中所有UTXO（含已花费和未花费），返回完整UTXO列表
+// 若需筛选「未花费」UTXO，可在遍历中添加 IsSpent == false 的过滤逻辑
+func (b *BlockChain) GetAllUTXO() ([]*UtxoEntry, error) {
+	// 1. 定义结果切片（动态扩容，UTXO数量未知时不预分配容量）
+	var utxoList []*UtxoEntry
+
+	// 2. 确定UTXO存储的数据库桶前缀（假设db包已定义UTXOBucket专门存储UTXO）
+	// 键格式：UTXOBucket前缀 + OutPoint字节（交易ID[32字节] + 输出索引[4字节]，共36字节）
+	bucketPrefix := db.UTXOBucket.Key()
+
+	// 3. 创建数据库迭代器：只遍历UTXO桶下的所有键值对（前缀匹配+上界开启）
+	iter, err := b.db.NewIterator(bucketPrefix, true)
+	if err != nil {
+		return nil, fmt.Errorf("创建UTXO迭代器失败: %w", err)
+	}
+	defer iter.Close() // 关键：遍历结束后释放迭代器资源，避免内存泄漏
+
+	// 4. 定位到UTXO桶的第一个元素（若桶为空，直接返回空列表）
+	if !iter.First() {
+		fmt.Println("UTXO桶中无数据")
+		return utxoList, nil
+	}
+
+	// 5. 循环遍历所有UTXO键值对
+	count := 0
+	for iter.Valid() {
+		// 5.1 验证当前键的格式合法性（可选但推荐，避免脏数据）
+		fullKey := iter.Key()
+		// 截取OutPoint部分（去掉桶前缀）
+		outPointBytes := fullKey[len(bucketPrefix):]
+		// OutPoint标准长度：交易ID(32字节) + 输出索引(4字节) = 36字节
+		if len(outPointBytes) != 36 {
+			return nil, fmt.Errorf("无效的UTXO键格式（长度不符）: 键=%x, 预期长度=36, 实际长度=%d", fullKey, len(outPointBytes))
+		}
+
+		// 5.2 获取当前UTXO的序列化值（复制数据避免引用迭代器临时切片）
+		value, err := iter.Value()
+		if err != nil {
+			return nil, fmt.Errorf("获取UTXO值失败（键=%x）: %w", fullKey, err)
+		}
+		// 深拷贝值数据（迭代器移动后原value可能失效）
+		valCopy := make([]byte, len(value))
+		copy(valCopy, value)
+
+		// 5.3 反序列化：Proto字节 → ProtoUTXO对象 → 业务层UtxoEntry
+		// 假设：wire包定义ProtoUtxoEntry，UtxoEntry实现FromProto方法（与BlockHeader保持一致）
+		var protoUTXO wire.ProtoUtxoEntry
+		if err := proto.Unmarshal(valCopy, &protoUTXO); err != nil {
+			return nil, fmt.Errorf("反序列化UTXO失败（键=%x）: %w", fullKey, err)
+		}
+		// 转换为业务层UTXO对象
+		utxoEntry := &UtxoEntry{}
+		if err := utxoEntry.FromProto(&protoUTXO); err != nil {
+			return nil, fmt.Errorf("UTXO格式转换失败（键=%x）: %w", fullKey, err)
+		}
+
+		// 5.4 将UTXO添加到结果列表（含已花费的UTXO，如需过滤可加：if !utxoEntry.IsSpent { ... }）
+		utxoList = append(utxoList, utxoEntry)
+
+		// 5.5 移动迭代器到下一个UTXO
+		iter.Next()
+		count++
+	}
+
+	fmt.Printf("UTXO遍历完成，共%d个UTXO条目（含已花费）\n", count)
+	// 7. 返回完整UTXO列表（按数据库存储顺序，无特定排序）
+	return utxoList, nil
+}
+
+func TraverseAllBlockHeaders1(store db.KeyValueStore) error {
+	bucketPrefix := db.BlockHeaderBucket.Key()
+	// 2. 创建迭代器：指定前缀，开启上界（只遍历以bucketPrefix开头的键）
+	iter, err := store.NewIterator(bucketPrefix, true)
+	if err != nil {
+		return fmt.Errorf("创建迭代器失败: %w", err)
+	}
+	defer iter.Close() // 关键：遍历结束后关闭迭代器，释放资源
+	// 3. 定位到第一个元素（迭代器起始位置）
+	if !iter.First() {
+		// 若没有数据，直接返回（iter.Valid()会为false）
+		fmt.Println("没有区块头数据")
+		return nil
+	}
+
+	// 4. 循环遍历所有区块头
+	count := 0
+	for iter.Valid() {
+		// a. 获取当前键（格式："bh:区块hash"）
+		fullKey := iter.Key()
+		// 截取区块hash（去掉前缀"bh:"）
+		hashBytes := fullKey[len(bucketPrefix):]
+		if len(hashBytes) != chainhash.HashSize { // HashSize为32（比特币hash长度）
+			return fmt.Errorf("无效的区块头key: %x", fullKey)
+		}
+		var blockHash chainhash.Hash
+		copy(blockHash[:], hashBytes)
+
+		// b. 获取当前值（序列化的区块头）
+		value, err := iter.Value()
+		if err != nil {
+			return fmt.Errorf("获取区块头值失败: %w", err)
+		}
+
+		// c. 处理区块头（如反序列化、打印信息）
+		// （这里复用core中已有的反序列化逻辑）
+		var protoHeader wire.ProtoBlockHeader
+		if err := proto.Unmarshal(value, &protoHeader); err != nil {
+			return fmt.Errorf("反序列化区块头失败: %w", err)
+		}
+		header := &core.BlockHeader{}
+		header.FromProto(&protoHeader)
+
+		// 打印信息（示例）
+		fmt.Printf("区块hash: %x, 版本: %d, 前块hash: %x\n",
+			blockHash, header.Version, header.PrevBlock)
+
+		// d. 移动到下一个元素
+		iter.Next()
+		count++
+	}
+	fmt.Printf("遍历完成，共%d个区块头\n", count)
+	return nil
+}
+
+//	根据目标地址查询其关联的所有未花费UTXO（Unspent Transaction Output）
+//
+// 实现逻辑：
+// 1. 扫描「地址→UTXO索引」桶，获取该地址关联的所有OutPoint（交易哈希+输出索引）
+// 2. 根据OutPoint查询完整的UTXO数据
+// 3. 过滤已花费的UTXO，返回未花费列表
+func (b *BlockChain) GetAddressAllUTXO(address string) ([]*UtxoEntry, error) {
+	// 1. 参数合法性校验
+	if address == "" {
+		return nil, fmt.Errorf("invalid parameter: address is empty")
+	}
+
+	// 2. 定义结果切片（存储未花费UTXO）
+	var unspentUTXOs []*UtxoEntry
+
+	// 3. 生成地址索引的扫描前缀（仅包含「桶前缀+地址」，用于迭代器前缀匹配）
+	// 键结构参考 addrIndexKey：[ScriptHashUTXOBucket] + [地址字节] + [交易哈希] + [输出索引]
+	// 此处仅用「桶前缀+地址」作为扫描前缀，确保迭代器只遍历该地址的所有索引项
+	addrIndexPrefix := db.ScriptHashUTXOBucket.Key([]byte(address))
+
+	// 4. 创建数据库迭代器（前缀匹配+上界开启，避免扫描无关数据）
+	iter, err := b.db.NewIterator(addrIndexPrefix, true)
+	if err != nil {
+		return nil, fmt.Errorf("create address index iterator failed: %w", err)
+	}
+	defer iter.Close() // 关键：确保迭代器资源释放，避免内存泄漏
+
+	// 5. 定位到第一个匹配前缀的索引项（若地址无关联UTXO，直接返回空列表）
+	if !iter.First() {
+		return unspentUTXOs, nil
+	}
+
+	// 6. 加锁保护UTXO缓存/数据库读取（与ApplyToMainChain保持一致的锁粒度）
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	// 7. 遍历该地址的所有索引项
+	for iter.Valid() {
+		// 7.1 验证当前键是否属于目标地址（避免前缀匹配的边界问题，如"addr1"与"addr123"）
+		fullKey := iter.Key()
+		// 截取「地址」部分：跳过「桶前缀」，剩余部分的前N字节为地址（N=len([]byte(address))）
+		addrStartIdx := len(db.ScriptHashUTXOBucket.Key()) // 桶前缀长度（通常为1字节）
+		addrEndIdx := addrStartIdx + len([]byte(address))
+		if len(fullKey) < addrEndIdx {
+			iter.Next()
+			log.Infof("键格式异常，跳过")
+			continue // 键格式异常，跳过
+		}
+		currentAddr := string(fullKey[addrStartIdx:addrEndIdx])
+		if currentAddr != address {
+			log.Infof("已超出目标地址的索引范围，停止遍历（迭代器按键有序排列）")
+			break // 已超出目标地址的索引范围，停止遍历（迭代器按键有序排列）
+		}
+
+		// 7.2 解析索引键中的OutPoint（交易哈希+输出索引）
+		// 键结构：[桶前缀] + [地址] + [交易哈希(32字节)] + [输出索引(4字节，小端序)]
+		hashStartIdx := addrEndIdx
+		hashEndIdx := hashStartIdx + chainhash.HashSize
+		indexStartIdx := hashEndIdx
+		indexEndIdx := indexStartIdx + OutPointIndexSize
+
+		// 校验键长度是否完整（避免脏数据导致的切片越界）
+		if len(fullKey) < indexEndIdx {
+			return nil, fmt.Errorf("invalid address index key format: key=%x, expected length >=%d",
+				fullKey, indexEndIdx)
+		}
+
+		// 7.2.1 解析交易哈希
+		var txHash chainhash.Hash
+		copy(txHash[:], fullKey[hashStartIdx:hashEndIdx])
+
+		// 7.2.2 解析输出索引（小端序，与UTXOKey保持一致）
+		indexBytes := fullKey[indexStartIdx:indexEndIdx]
+		outputIndex := binary.LittleEndian.Uint32(indexBytes)
+
+		// 7.3 根据OutPoint构造UTXO的数据库键（复用现有UTXOKey方法，确保与存储逻辑一致）
+		utxoKey := b.UTXOKey(txHash, outputIndex)
+
+		// 7.4 读取并解析UTXO完整数据
+		var utxoBytes []byte
+		err := b.db.Get(utxoKey, func(value []byte) error {
+			if value == nil {
+				return db.ErrKeyNotFound
+			}
+			// 深拷贝数据（避免引用数据库临时切片）
+			utxoBytes = make([]byte, len(value))
+			copy(utxoBytes, value)
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("get UTXO by outpoint (txHash=%s, index=%d) failed: %w",
+				txHash.String(), outputIndex, err)
+		}
+		// 若UTXO已被删除（已花费），跳过
+		if utxoBytes == nil {
+			iter.Next()
+			continue
+		}
+
+		// 7.5 反序列化UTXO（Proto→UtxoEntry，与存储逻辑对应）
+		var protoUTXO wire.ProtoUtxoEntry
+		if err := proto.Unmarshal(utxoBytes, &protoUTXO); err != nil {
+			return nil, fmt.Errorf("unmarshal UTXO (txHash=%s, index=%d) failed: %w",
+				txHash.String(), outputIndex, err)
+		}
+		utxoEntry := &UtxoEntry{}
+		if err := utxoEntry.FromProto(&protoUTXO); err != nil {
+			return nil, fmt.Errorf("convert ProtoUTXO to UtxoEntry (txHash=%s, index=%d) failed: %w",
+				txHash.String(), outputIndex, err)
+		}
+
+		// 7.6 过滤已花费UTXO（仅保留未花费的）
+		if !utxoEntry.IsSpent() {
+			unspentUTXOs = append(unspentUTXOs, utxoEntry)
+		}
+
+		// 7.7 移动迭代器到下一个索引项
+		iter.Next()
+	}
+
+	// 9. 返回未花费UTXO列表（按数据库键顺序排列，通常为UTXO创建时间顺序）
+	return unspentUTXOs, nil
+}
+
+func (b *BlockChain) GetAddressAllUTXOFull(address string) ([]*UtxoEntryFull, error) {
+	// 1. 参数合法性校验
+	if address == "" {
+		return nil, fmt.Errorf("invalid parameter: address is empty")
+	}
+
+	// 2. 定义结果切片（存储未花费UTXO）
+	var unspentUTXOs []*UtxoEntryFull
+
+	// 3. 生成地址索引的扫描前缀（仅包含「桶前缀+地址」，用于迭代器前缀匹配）
+	// 键结构参考 addrIndexKey：[ScriptHashUTXOBucket] + [地址字节] + [交易哈希] + [输出索引]
+	// 此处仅用「桶前缀+地址」作为扫描前缀，确保迭代器只遍历该地址的所有索引项
+	addrIndexPrefix := db.ScriptHashUTXOBucket.Key([]byte(address))
+
+	// 4. 创建数据库迭代器（前缀匹配+上界开启，避免扫描无关数据）
+	iter, err := b.db.NewIterator(addrIndexPrefix, true)
+	if err != nil {
+		return nil, fmt.Errorf("create address index iterator failed: %w", err)
+	}
+	defer iter.Close() // 关键：确保迭代器资源释放，避免内存泄漏
+
+	// 5. 定位到第一个匹配前缀的索引项（若地址无关联UTXO，直接返回空列表）
+	if !iter.First() {
+		return unspentUTXOs, nil
+	}
+
+	// 6. 加锁保护UTXO缓存/数据库读取（与ApplyToMainChain保持一致的锁粒度）
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	// 7. 遍历该地址的所有索引项
+	for iter.Valid() {
+		// 7.1 验证当前键是否属于目标地址（避免前缀匹配的边界问题，如"addr1"与"addr123"）
+		fullKey := iter.Key()
+		// 截取「地址」部分：跳过「桶前缀」，剩余部分的前N字节为地址（N=len([]byte(address))）
+		addrStartIdx := len(db.ScriptHashUTXOBucket.Key()) // 桶前缀长度（通常为1字节）
+		addrEndIdx := addrStartIdx + len([]byte(address))
+		if len(fullKey) < addrEndIdx {
+			iter.Next()
+			log.Infof("键格式异常，跳过")
+			continue // 键格式异常，跳过
+		}
+		currentAddr := string(fullKey[addrStartIdx:addrEndIdx])
+		if currentAddr != address {
+			log.Infof("已超出目标地址的索引范围，停止遍历（迭代器按键有序排列）")
+			break // 已超出目标地址的索引范围，停止遍历（迭代器按键有序排列）
+		}
+
+		// 7.2 解析索引键中的OutPoint（交易哈希+输出索引）
+		// 键结构：[桶前缀] + [地址] + [交易哈希(32字节)] + [输出索引(4字节，小端序)]
+		hashStartIdx := addrEndIdx
+		hashEndIdx := hashStartIdx + chainhash.HashSize
+		indexStartIdx := hashEndIdx
+		indexEndIdx := indexStartIdx + OutPointIndexSize
+
+		// 校验键长度是否完整（避免脏数据导致的切片越界）
+		if len(fullKey) < indexEndIdx {
+			return nil, fmt.Errorf("invalid address index key format: key=%x, expected length >=%d",
+				fullKey, indexEndIdx)
+		}
+
+		// 7.2.1 解析交易哈希
+		var txHash chainhash.Hash
+		copy(txHash[:], fullKey[hashStartIdx:hashEndIdx])
+
+		// 7.2.2 解析输出索引（小端序，与UTXOKey保持一致）
+		indexBytes := fullKey[indexStartIdx:indexEndIdx]
+		outputIndex := binary.LittleEndian.Uint32(indexBytes)
+
+		// 7.3 根据OutPoint构造UTXO的数据库键（复用现有UTXOKey方法，确保与存储逻辑一致）
+		utxoKey := b.UTXOKey(txHash, outputIndex)
+
+		// 7.4 读取并解析UTXO完整数据
+		var utxoBytes []byte
+		err := b.db.Get(utxoKey, func(value []byte) error {
+			if value == nil {
+				return db.ErrKeyNotFound
+			}
+			// 深拷贝数据（避免引用数据库临时切片）
+			utxoBytes = make([]byte, len(value))
+			copy(utxoBytes, value)
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("get UTXO by outpoint (txHash=%s, index=%d) failed: %w",
+				txHash.String(), outputIndex, err)
+		}
+		// 若UTXO已被删除（已花费），跳过
+		if utxoBytes == nil {
+			iter.Next()
+			continue
+		}
+
+		// 7.5 反序列化UTXO（Proto→UtxoEntry，与存储逻辑对应）
+		var protoUTXO wire.ProtoUtxoEntry
+		if err := proto.Unmarshal(utxoBytes, &protoUTXO); err != nil {
+			return nil, fmt.Errorf("unmarshal UTXO (txHash=%s, index=%d) failed: %w",
+				txHash.String(), outputIndex, err)
+		}
+		utxoEntry := &UtxoEntry{}
+		if err := utxoEntry.FromProto(&protoUTXO); err != nil {
+			return nil, fmt.Errorf("convert ProtoUTXO to UtxoEntry (txHash=%s, index=%d) failed: %w",
+				txHash.String(), outputIndex, err)
+		}
+
+		utxoEntryFull := &UtxoEntryFull{
+			UtxoEntry: UtxoEntry{
+				amount:      utxoEntry.amount,
+				pkScript:    utxoEntry.pkScript,
+				blockHeight: utxoEntry.blockHeight,
+				packedFlags: utxoEntry.packedFlags,
+			},
+			Hash:  txHash,
+			Index: outputIndex,
+		}
+
+		// 7.6 过滤已花费UTXO（仅保留未花费的）
+		if !utxoEntry.IsSpent() {
+			unspentUTXOs = append(unspentUTXOs, utxoEntryFull)
+		}
+
+		// 7.7 移动迭代器到下一个索引项
+		iter.Next()
+	}
+
+	// 9. 返回未花费UTXO列表（按数据库键顺序排列，通常为UTXO创建时间顺序）
+	return unspentUTXOs, nil
+}
+
+// GetMainBlockByHeight 根据给定高度获取主链上对应的完整区块（core.Block）
+// 实现逻辑：高度→区块哈希（通过高度索引）→ 区块头+区块体（通过哈希查询）→ 组装为core.Block
+func (b *BlockChain) GetMainBlockByHeight(height int32) (*core.Block, error) {
+	// 1. 输入参数合法性校验
+	if height < 0 {
+		return nil, fmt.Errorf("invalid height: must be non-negative (got %d)", height)
+	}
+
+	// 2. 先通过高度获取对应的区块哈希（依赖「高度→哈希」索引）
+	blockHash, err := b.MainChainGetHashByHeightInit32(height)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block hash by height %d: %w", height, err)
+	}
+	if blockHash == nil {
+		return nil, fmt.Errorf("no block hash found for height %d", height)
+	}
+
+	// 3. 根据哈希获取区块头（复用已有GetBlockHeader方法）
+	header, err := b.GetBlockHeader(blockHash[:])
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block header (hash: %s, height: %d): %w", blockHash, height, err)
+	}
+	if header == nil {
+		return nil, fmt.Errorf("block header not found (hash: %s, height: %d)", blockHash, height)
+	}
+
+	// 4. 根据哈希获取区块体（逆序实现SaveBlock中的区块体存储逻辑）
+	// 4.1 构造区块体的数据库键（BlockBodyBucket + 区块哈希）
+	bodyKey := db.BlockBodyBucket.Key(blockHash[:])
+	var bodyBytes []byte
+
+	// 4.2 从数据库读取区块体的序列化字节
+	err = b.db.Get(bodyKey, func(value []byte) error {
+		if value == nil {
+			return db.ErrKeyNotFound
+		}
+		// 深拷贝数据，避免引用数据库内部临时切片
+		bodyBytes = make([]byte, len(value))
+		copy(bodyBytes, value)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block body (hash: %s, height: %d): %w", blockHash, height, err)
+	}
+	if bodyBytes == nil {
+		return nil, fmt.Errorf("block body not found (hash: %s, height: %d)", blockHash, height)
+	}
+
+	// 4.3 区块体反序列化：Proto字节 → wire.ProtoMsgBlockBody → core.BlockBody
+	var protoBody wire.ProtoMsgBlockBody
+	if err := proto.Unmarshal(bodyBytes, &protoBody); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block body (hash: %s, height: %d): %w", blockHash, height, err)
+	}
+	// 转换为业务层的BlockBody（假设core.BlockBody实现了FromProto方法，与BlockHeader保持一致）
+	body := &core.MsgBlockBody{}
+	if err := body.FromProto(&protoBody); err != nil {
+		return nil, fmt.Errorf("failed to convert proto body to core.BlockBody (hash: %s, height: %d): %w", blockHash, height, err)
+	}
+
+	// 5. 组装完整的core.Block（需贴合core.Block的结构定义）
+	// 核心：用区块头+区块体创建Block实例（假设core包提供NewBlock或直接构造的方式）
+	// 注：若core.Block需要显式设置哈希，可补充设置（避免重复计算）
+	block, err := core.NewBlockByHeaderAndBody(header, body) // 假设core包有此构造函数，接收header和body
+	if err != nil {
+		return nil, fmt.Errorf("failed to create core.Block (hash: %s, height: %d)", blockHash, height)
+	}
+
+	// 可选优化：显式设置区块哈希（若core.Block的Hash()方法需要计算，此处直接复用已获取的哈希可提升性能）
+	// 需确保core.Block有SetHash方法（若没有可省略）
+	if err := block.SetHash(blockHash); err != nil {
+		return nil, fmt.Errorf("failed to set block hash (hash: %s, height: %d): %w", blockHash, height, err)
+	}
+	block.SetHeight(height)
+
+	//查询区块缓存工作总量
+	chainwork, err := b.GetBlockChainWorkByHash(*blockHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create core.Block (hash: %s, height: %d)", blockHash, height)
+	}
+	err1 := block.SetChainWork(chainwork)
+	if err1 != nil {
+		return nil, err1
+	}
+	// 6. 返回组装好的完整区块
+	return block, nil
+}
+
+// GetBlockHeightByHash 根据区块哈希获取对应的区块高度
+// 依赖 HashToHeight 桶中存储的「区块哈希→高度」映射关系
+func (b *BlockChain) GetBlockHeightByHash(hash *chainhash.Hash) (int32, error) {
+	// 1. 参数合法性校验（避免空指针导致的后续切片操作异常）
+	if hash == nil {
+		return 0, fmt.Errorf("invalid parameter: hash is nil")
+	}
+
+	// 2. 构造数据库查询键：HashToHeight桶 + 区块哈希字节（与SaveBlock存储逻辑一致）
+	key := db.HashToHeight.Key(hash[:])
+
+	var heightBytes []byte
+	// 3. 从数据库读取高度的字节数据（深拷贝避免引用数据库临时切片）
+	err := b.db.Get(key, func(value []byte) error {
+		if value == nil {
+			return db.ErrKeyNotFound // 键不存在，说明该哈希对应的区块未在主链索引中
+		}
+		// 验证高度字节长度（int32固定为4字节，与Int32ToBytes保持一致）
+		if len(value) != 4 {
+			return fmt.Errorf("invalid height bytes length: got %d, expected 4 (hash: %s)",
+				len(value), hash.String())
+		}
+		heightBytes = make([]byte, len(value))
+		copy(heightBytes, value)
+		return nil
+	})
+
+	// 4. 处理数据库操作错误（包装错误上下文，便于调试）
+	if err != nil {
+		return 0, fmt.Errorf("failed to get height by hash %s: %w", hash.String(), err)
+	}
+
+	// 5. 字节切片转int32（小端序，与Int32ToBytes的存储逻辑一致）
+	height := int32(binary.LittleEndian.Uint32(heightBytes))
+
+	// 6. 高度合理性校验（区块链高度非负，创世区块高度为0）
+	if height < 0 {
+		return 0, fmt.Errorf("invalid block height: %d (hash: %s)", height, hash.String())
+	}
+
+	return height, nil
+}
+
+// GetBlockByHash 通过哈希查询完整区块
+// GetBlockByHash 通过区块哈希查询完整的主链区块（core.Block）
+// 实现逻辑：哈希查头 → 哈希查体 → 哈希查高度/工作量 → 组装完整区块
+func (bc *BlockChain) GetBlockByHash(hash *chainhash.Hash) (*core.Block, error) {
+	// 1. 参数合法性校验
+	if hash == nil {
+		return nil, fmt.Errorf("invalid parameter: hash is nil")
+	}
+	hashStr := hash.String() // 预存哈希字符串，简化错误信息拼接
+
+	// 2. 步骤1：通过哈希获取区块头（复用已有GetBlockHeader方法，避免重复代码）
+	header, err := bc.GetBlockHeader(hash[:])
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block header (hash: %s): %w", hashStr, err)
+	}
+	if header == nil {
+		return nil, fmt.Errorf("block header not found (hash: %s)", hashStr)
+	}
+	// 3. 步骤2：通过哈希获取区块体（逆序SaveBlock中的区块体存储逻辑）
+	// 3.1 构造区块体查询键（BlockBodyBucket + 区块哈希）
+	bodyKey := db.BlockBodyBucket.Key(hash[:])
+	var bodyBytes []byte
+
+	// 3.2 读取区块体字节数据
+	err = bc.db.Get(bodyKey, func(value []byte) error {
+		if value == nil {
+			return db.ErrKeyNotFound
+		}
+		bodyBytes = make([]byte, len(value))
+		copy(bodyBytes, value)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block body (hash: %s): %w", hashStr, err)
+	}
+	if bodyBytes == nil {
+		return nil, fmt.Errorf("block body not found (hash: %s)", hashStr)
+	}
+
+	// 3.3 区块体反序列化（Proto→core.MsgBlockBody，与SaveBlock保持一致）
+	var protoBody wire.ProtoMsgBlockBody
+	if err := proto.Unmarshal(bodyBytes, &protoBody); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block body (hash: %s): %w", hashStr, err)
+	}
+	body := &core.MsgBlockBody{}
+	if err := body.FromProto(&protoBody); err != nil {
+		return nil, fmt.Errorf("failed to convert proto body to core.BlockBody (hash: %s): %w", hashStr, err)
+	}
+
+	// 4. 步骤3：补充区块元数据（高度、工作量，提升返回数据完整性）
+	// 4.1 获取区块高度（复用刚实现的GetBlockHeightByHash）
+	height, err := bc.GetBlockHeightByHash(hash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block height (hash: %s): %w", hashStr, err)
+	}
+
+	// 4.2 获取区块工作量（复用已有GetBlockChainWorkByHash）
+	chainWork, err := bc.GetBlockChainWorkByHash(*hash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block chain work (hash: %s): %w", hashStr, err)
+	}
+
+	// 5. 步骤4：组装完整core.Block（贴合现有构造逻辑，参考GetMainBlockByHeight）
+	// 假设core包提供NewBlockByHeaderAndBody构造函数，接收区块头和区块体
+	block, err := core.NewBlockByHeaderAndBody(header, body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create core.Block (hash: %s): %w", hashStr, err)
+	}
+
+	// 6. 补充区块元数据（避免重复计算，提升性能）
+	if err := block.SetHash(hash); err != nil { // 显式设置哈希（若core.Block支持）
+		return nil, fmt.Errorf("failed to set block hash (hash: %s): %w", hashStr, err)
+	}
+	block.SetHeight(height)                               // 设置高度
+	if err := block.SetChainWork(chainWork); err != nil { // 设置工作量
+		return nil, fmt.Errorf("failed to set block chain work (hash: %s): %w", hashStr, err)
+	}
+
+	// 7. 判断区块是否在主链上
+	// 逻辑：通过当前区块高度获取主链哈希，与当前区块哈希比对
+	mainChainHash, err := bc.MainChainGetHashByHeightInit32(height)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check main chain status (hash: %s, height: %d): %w", hashStr, height, err)
+	}
+	block.IsMainChain = mainChainHash != nil && mainChainHash.IsEqual(hash)
+
+	return block, nil
+}
+
+// GetBlockByHeight 通过高度查询完整区块
+// GetBlockByHeight 通过高度查询主链上对应的完整区块（core.Block）
+// 实现逻辑：先通过高度获取区块哈希（依赖高度→哈希索引），再通过哈希查询完整区块
+func (bc *BlockChain) GetBlockByHeight(height int32) (*core.Block, error) {
+	// 1. 参数合法性校验（区块链高度非负，创世区块高度为0）
+	if height < 0 {
+		return nil, fmt.Errorf("invalid parameter: height must be non-negative (got %d)", height)
+	}
+
+	// 2. 步骤1：根据高度获取对应的区块哈希（复用现有索引查询逻辑）
+	blockHash, err := bc.MainChainGetHashByHeightInit32(height)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block hash by height %d: %w", height, err)
+	}
+	if blockHash == nil {
+		return nil, fmt.Errorf("no block hash found for height %d (main chain has no such height)", height)
+	}
+
+	// 3. 步骤2：根据哈希查询完整区块（复用GetBlockByHash的成熟逻辑，避免重复编码）
+	block, err := bc.GetBlockByHash(blockHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block by hash %s (height %d): %w", blockHash.String(), height, err)
+	}
+
+	// 4. （可选）二次校验：确保返回区块的高度与查询高度一致（避免索引数据异常）
+	if block.BlockHeight != height {
+		return nil, fmt.Errorf("data inconsistency: block hash %s claims height %d, but query height is %d",
+			blockHash.String(), block.BlockHeight, height)
+	}
+
+	// 5. 明确标记主链状态（通过主链高度获取的哈希必然属于主链）
+	block.IsMainChain = true
+
+	return block, nil
+}
+
+// GetTxByTxId 根据交易ID（TxHash）查询对应的完整交易（core.MsgTx）
+// 实现逻辑：
+// 1. 通过「交易ID→区块哈希」索引（TxToBlockBucket）定位交易所在区块
+// 2. 通过区块哈希查询完整区块（复用GetBlockByHash方法）
+// 3. 遍历区块内交易列表，匹配目标交易ID并返回
+func (bc *BlockChain) GetTxByTxId(hash *chainhash.Hash) (*core.MsgTx, error) {
+	// 1. 参数合法性校验：避免空指针导致后续切片操作异常
+	if hash == nil {
+		return nil, fmt.Errorf("invalid parameter: transaction hash is nil")
+	}
+	txHashStr := hash.String() // 预存交易ID字符串，简化错误信息拼接
+
+	// 2. 加读锁：与其他查询方法保持一致的锁粒度（读操作使用RLock，避免阻塞写操作）
+	bc.chainLock.RLock()
+	defer bc.chainLock.RUnlock()
+
+	// 3. 构造数据库查询键：TxToBlockBucket（交易ID→区块哈希索引桶） + 交易ID字节
+	txToBlockKey := db.TxToBlockBucket.Key(hash[:])
+
+	// 4. 从数据库读取交易ID对应的「区块哈希字节」
+	var blockHashBytes []byte
+	err := bc.db.Get(txToBlockKey, func(value []byte) error {
+		if value == nil {
+			return db.ErrKeyNotFound // 键不存在 → 交易ID未被索引（交易不存在或未上链）
+		}
+		// 验证区块哈希长度合法性（区块链标准哈希为32字节）
+		if len(value) != chainhash.HashSize {
+			return fmt.Errorf("invalid block hash length for tx %s: got %d, expected %d",
+				txHashStr, len(value), chainhash.HashSize)
+		}
+		// 深拷贝数据：避免引用数据库内部临时切片（迭代器/读取器释放后失效）
+		blockHashBytes = make([]byte, len(value))
+		copy(blockHashBytes, value)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block hash by tx id %s: %w", txHashStr, err)
+	}
+
+	// 5. 将「区块哈希字节」转换为chainhash.Hash类型（便于后续调用GetBlockByHash）
+	blockHash, err := chainhash.NewHash(blockHashBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert bytes to block hash (tx id: %s): %w", txHashStr, err)
+	}
+
+	// 6. 通过区块哈希查询完整区块（复用已实现的GetBlockByHash，避免重复编码）
+	block, err := bc.GetBlockByHash(blockHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block by hash %s (tx id: %s): %w", blockHash, txHashStr, err)
+	}
+	if block == nil {
+		return nil, fmt.Errorf("block not found for tx id %s (block hash: %s)", txHashStr, blockHash)
+	}
+
+	// 7. 遍历区块内交易列表，匹配目标交易ID
+	transactions := block.Transactions() // 假设core.Block的Transactions()返回交易列表
+	for _, tx := range transactions {
+		// 获取当前交易的ID（与输入的hash类型一致）
+		currentTxHash := tx.MsgTx().TxHash()
+		// 比对交易ID：使用chainhash.Hash的IsEqual方法确保字节级一致
+		if currentTxHash.IsEqual(hash) {
+			// 找到匹配交易，返回其MsgTx实例
+			return tx.MsgTx(), nil
+		}
+	}
+
+	// 8. 遍历完成未找到交易（理论上不应发生，除非索引与区块数据不一致）
+	return nil, fmt.Errorf("transaction with id %s not found in block %s", txHashStr, blockHash)
+}
+
+// GetUTXOByTxIdAndOutIndex 根据交易ID（字符串）和输出索引查询对应的UTXO条目
+// 实现逻辑：
+// 1. 校验参数合法性
+// 2. 交易ID字符串转chainhash.Hash类型
+// 3. 构造UTXO在数据库中的存储键（基于OutPoint：交易哈希+输出索引）
+// 4. 读取并反序列化UTXO数据
+// 5. 返回业务层UTXO条目
+func (b *BlockChain) GetUTXOByTxIdAndOutIndex(id string, index uint32) (UtxoEntry, error) {
+	// 1. 参数合法性校验
+	// 1.1 交易ID不能为空（区块链交易ID为32字节哈希的十六进制字符串，长度64）
+	if id == "" {
+		return UtxoEntry{}, errors.New("invalid parameter: transaction ID is empty")
+	}
+	// 1.2 输出索引虽为uint32（天然非负），但可补充业务校验（如索引过大的提示）
+	if index > 0xffffffff { // 理论上uint32最大为0xffffffff，此处为示例校验
+		return UtxoEntry{}, fmt.Errorf("invalid parameter: output index %d is out of range", index)
+	}
+
+	// 2. 交易ID字符串转chainhash.Hash（区块链标准哈希类型）
+	// 注意：交易ID字符串是哈希的十六进制表示，需用NewHashFromStr转换
+	txHash, err := chainhash.NewHashFromStr(id)
+	if err != nil {
+		return UtxoEntry{}, fmt.Errorf("failed to parse transaction ID: %w (input ID: %s)", err, id)
+	}
+
+	// 3. 加读锁：与其他UTXO/区块查询方法保持一致的并发安全策略（读操作加RLock）
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	// 4. 构造UTXO的数据库存储键
+	// 键结构：db.UTXOBucket（UTXO专属桶） + OutPoint字节（交易哈希32字节 + 索引4字节小端序）
+	// 若项目已实现UTXOKey方法，可直接复用（如GetAddressAllUTXO中使用的b.UTXOKey）
+	var utxoKey []byte
+	if b.UTXOKey != nil {
+		// 复用现有UTXO键生成逻辑（推荐，确保存储/查询一致性）
+		utxoKey = b.UTXOKey(*txHash, index)
+	} else {
+		// 若未实现UTXOKey，此处手动构造（需与SaveUTXO的键逻辑完全一致）
+		outPointBytes := make([]byte, chainhash.HashSize+OutPointIndexSize)
+		// 拼接交易哈希（32字节）
+		copy(outPointBytes[:chainhash.HashSize], txHash[:])
+		// 拼接输出索引（4字节小端序，与Int32ToBytes的字节序保持一致）
+		binary.LittleEndian.PutUint32(outPointBytes[chainhash.HashSize:], index)
+		// 生成带桶前缀的完整键
+		utxoKey = db.UTXOBucket.Key(outPointBytes)
+	}
+
+	// 5. 从数据库读取UTXO的序列化字节数据
+	var utxoBytes []byte
+	err = b.db.Get(utxoKey, func(value []byte) error {
+		if value == nil {
+			return db.ErrKeyNotFound // 键不存在 → UTXO未找到（可能已花费或从未存在）
+		}
+		// 深拷贝数据：避免引用数据库内部的临时切片（迭代器/读取器释放后失效）
+		utxoBytes = make([]byte, len(value))
+		copy(utxoBytes, value)
+		return nil
+	})
+	if err != nil {
+		return UtxoEntry{}, fmt.Errorf("failed to get UTXO from DB: %w (tx ID: %s, index: %d)", err, id, index)
+	}
+	// 额外判断：若读取到的字节为空（键存在但值为空，理论上不应发生）
+	if utxoBytes == nil {
+		return UtxoEntry{}, fmt.Errorf("UTXO value is empty (tx ID: %s, index: %d)", id, index)
+	}
+
+	// 6. 反序列化：Proto字节 → wire.ProtoUtxoEntry（与存储逻辑对应）
+	var protoUTXO wire.ProtoUtxoEntry
+	if err := proto.Unmarshal(utxoBytes, &protoUTXO); err != nil {
+		return UtxoEntry{}, fmt.Errorf("failed to unmarshal UTXO: %w (tx ID: %s, index: %d)", err, id, index)
+	}
+
+	// 7. 格式转换：wire.ProtoUtxoEntry → 业务层UtxoEntry（与GetAllUTXO逻辑一致）
+	var utxoEntry UtxoEntry
+	if err := utxoEntry.FromProto(&protoUTXO); err != nil {
+		return UtxoEntry{}, fmt.Errorf("failed to convert proto UTXO to UtxoEntry: %w (tx ID: %s, index: %d)", err, id, index)
+	}
+
+	// 8. 返回业务层UTXO条目（方法定义返回值为UtxoEntry，非指针）
+	return utxoEntry, nil
+}
+
+// GetUTXOByOutPoint 根据批量交易输出点（OutPoint）查询对应的UTXO条目列表
+// 每个OutPoint对应一个UTXO（若存在），返回列表与输入OutPoint列表顺序一致
+// 若任意OutPoint处理失败（如不存在、反序列化错误），直接返回错误
+func (b *BlockChain) GetUTXOByOutPoint(outPoints []core.OutPoint) ([]UtxoEntry, error) {
+	// -------------------------- 1. 参数合法性校验 --------------------------
+	// 1.1 禁止空指针输入（避免后续遍历panic）
+	if outPoints == nil {
+		return nil, errors.New("invalid parameter: outPoints cannot be nil")
+	}
+	// 1.2 校验每个OutPoint的有效性（TxHash不可为nil，否则无法定位UTXO）
+	for idx, op := range outPoints {
+		// 可选：输出索引合理性校验（uint32天然非负，此处可补充业务上限校验）
+		if op.Index > 1000000 { // 示例：假设单交易最大输出数不超过100万（根据业务调整）
+			return nil, fmt.Errorf("outPoints[%d] has invalid index: %d (exceeds business limit)", idx, op.Index)
+		}
+	}
+
+	// -------------------------- 2. 并发安全控制 --------------------------
+	// 读操作加共享锁（RLock），避免阻塞其他读操作，仅阻塞写操作（如UTXO更新）
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	// -------------------------- 3. 预分配结果切片 --------------------------
+	// 预分配与输入长度一致的容量，避免动态扩容开销（输出列表与输入顺序严格对应）
+	result := make([]UtxoEntry, 0, len(outPoints))
+
+	// -------------------------- 4. 遍历处理每个OutPoint --------------------------
+	for idx, op := range outPoints {
+		txHash := op.Hash       // 当前OutPoint对应的交易哈希
+		outputIndex := op.Index // 当前OutPoint对应的输出索引
+
+		// -------------------------- 4.1 构造UTXO数据库查询键 --------------------------
+		// 复用项目已有UTXO键生成逻辑（若存在`UTXOKey`方法），确保与存储逻辑一致
+		var utxoKey []byte
+		if b.UTXOKey != nil {
+			// 优先使用对象内置的键生成方法（如GetAddressAllUTXO中复用的逻辑）
+			utxoKey = b.UTXOKey(txHash, outputIndex)
+		} else {
+			// 若未实现`UTXOKey`，手动构造键（需与UTXO存储时的键格式完全一致）
+			// 键结构：[UTXOBucket前缀] + [交易哈希(32字节)] + [输出索引(4字节，小端序)]
+			outPointBytes := make([]byte, chainhash.HashSize+OutPointIndexSize)
+			// 拼接交易哈希（32字节）
+			copy(outPointBytes[:chainhash.HashSize], txHash[:])
+			// 拼接输出索引（4字节，小端序，与Int32ToBytes保持字节序一致）
+			binary.LittleEndian.PutUint32(outPointBytes[chainhash.HashSize:], outputIndex)
+			// 生成带桶前缀的完整查询键
+			utxoKey = db.UTXOBucket.Key(outPointBytes)
+		}
+
+		// -------------------------- 4.2 从数据库读取UTXO字节数据 --------------------------
+		var utxoBytes []byte
+		err := b.db.Get(utxoKey, func(value []byte) error {
+			if value == nil {
+				// 键不存在 → 该OutPoint对应的UTXO未创建或已花费
+				return db.ErrKeyNotFound
+			}
+			// 深拷贝数据：避免引用数据库内部临时切片（迭代器/读取器释放后数据失效）
+			utxoBytes = make([]byte, len(value))
+			copy(utxoBytes, value)
+			return nil
+		})
+		if err != nil {
+			// 包装错误上下文：明确标记是哪个OutPoint处理失败，便于调试
+			return nil, fmt.Errorf("failed to read UTXO for outPoints[%d] (TxHash: %s, Index: %d): %w",
+				idx, txHash.String(), outputIndex, err)
+		}
+
+		// -------------------------- 4.3 反序列化UTXO数据 --------------------------
+		// 步骤1：Proto字节 → wire.ProtoUtxoEntry（与存储时的序列化格式对应）
+		var protoUTXO wire.ProtoUtxoEntry
+		if err := proto.Unmarshal(utxoBytes, &protoUTXO); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal UTXO for outPoints[%d] (TxHash: %s, Index: %d): %w",
+				idx, txHash.String(), outputIndex, err)
+		}
+
+		// 步骤2：wire.ProtoUtxoEntry → 业务层UtxoEntry（复用FromProto方法，与其他UTXO查询统一）
+		var utxoEntry UtxoEntry
+		if err := utxoEntry.FromProto(&protoUTXO); err != nil {
+			return nil, fmt.Errorf("failed to convert ProtoUTXO to UtxoEntry for outPoints[%d] (TxHash: %s, Index: %d): %w",
+				idx, txHash.String(), outputIndex, err)
+		}
+
+		// -------------------------- 4.4 将UTXO加入结果列表 --------------------------
+		result = append(result, utxoEntry)
+	}
+
+	// -------------------------- 5. 处理完成，返回结果 --------------------------
+	return result, nil
+}
+
+//	获取主链上最新的完整区块（高度最高的区块）
+//
+// 实现逻辑：先获取最新区块的哈希，再通过哈希查询完整区块信息
+func (b *BlockChain) GetBestBlock() (*core.Block, error) {
+	// 加读锁确保并发安全（与其他查询方法保持一致的锁策略）
+	b.chainLock.RLock()
+	defer b.chainLock.RUnlock()
+
+	// 1. 获取主链最新区块的哈希
+	latestHash, err := b.GetMainLatestHash()
+	if err != nil {
+		return nil, fmt.Errorf("获取最新区块哈希失败: %w", err)
+	}
+
+	// 2. 通过最新哈希查询完整区块（复用已实现的GetBlockByHash方法）
+	bestBlock, err := b.GetBlockByHash(&latestHash)
+	if err != nil {
+		return nil, fmt.Errorf("通过最新哈希查询区块失败 (hash: %s): %w", latestHash.String(), err)
+	}
+
+	// 3. 验证区块有效性（确保返回的区块确实是主链最新区块）
+	if bestBlock == nil {
+		return nil, fmt.Errorf("最新区块不存在 (hash: %s)", latestHash.String())
+	}
+
+	// 额外校验：区块高度应与主链最新高度一致（避免数据不一致）
+	latestHeight, err := b.GetMainLatestHeight()
+	if err != nil {
+		return nil, fmt.Errorf("验证最新区块高度失败: %w", err)
+	}
+	if bestBlock.BlockHeight != latestHeight {
+		return nil, fmt.Errorf("数据不一致: 最新区块哈希对应的高度为 %d，与主链最新高度 %d 不匹配",
+			bestBlock.BlockHeight, latestHeight)
+	}
+
+	return bestBlock, nil
+}

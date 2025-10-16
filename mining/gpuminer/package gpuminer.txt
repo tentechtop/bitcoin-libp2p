@@ -1,0 +1,647 @@
+package gpuminer
+
+import "C"
+import (
+	"bitcoin/blockchain"
+	"bitcoin/chaincfg/chainhash"
+	wire2 "bitcoin/core"
+	"bitcoin/mining"
+	"bitcoin/utils"
+
+	"fmt"
+	"math"
+	"math/big"
+	"unsafe"
+
+	"runtime"
+	"sync"
+	"time"
+)
+
+// 共享挖矿结果，所有 worker 只设置一次
+type CUDAMiningResult struct {
+	Found int32    // 1:找到有效nonce，0:未找到
+	Nonce uint32   // 有效nonce值
+	Hash  [32]byte // 符合难度的区块哈希
+}
+
+// 共享挖矿结果（单例模式，所有GPU任务共用）
+type MiningResult struct {
+	Found bool
+	Nonce uint32
+	Hash  chainhash.Hash
+	Mu    sync.Mutex
+}
+
+type Config struct {
+	ChainParams            *wire2.Params
+	BlockTemplateGenerator *mining.BlkTmplGenerator
+	MiningAddrs            []utils.Address
+	ProcessBlock           func(*wire2.Block, blockchain.BehaviorFlags) (bool, error)
+	ConnectedCount         func() int32
+	IsCurrent              func() bool
+
+	GPUDeviceID          int    // GPU设备ID（默认0）
+	PTXFilePath          string // miningKernel.ptx 文件路径
+	GPUMiningPerformance int    // GPU性能占比（0-100，默认100）
+}
+
+// CUDAMiner 封装 CUDA 挖矿核心资源（完善原有结构）
+type CUDAMiner struct {
+	mu              sync.Mutex    // 并发安全锁
+	deviceID        C.int         // CUDA设备ID
+	context         C.CUcontext   // CUDA上下文句柄
+	module          C.CUmodule    // PTX模块句柄
+	kernel          C.CUfunction  // 挖矿内核函数
+	blockSize       C.int         // 线程块大小（需与内核匹配，默认256）
+	gridSize        C.int         // 网格大小（根据设备性能动态调整）
+	performance     int           // GPU性能占比（0-100）
+	isInitialized   bool          // 初始化状态标记
+	globalResultPtr C.CUdeviceptr // 内核全局结果变量指针（devResult）
+}
+
+var (
+	defaultNumWorkers = uint32(runtime.NumCPU())
+
+	// CUDA 常量（与 Java 版本对齐）
+	defaultBlockSize = C.int(256)  // 线程块大小（内核优化值）
+	minGridSize      = C.int(1)    // 最小网格大小
+	maxGridSize      = C.int(4096) // 最大网格大小
+	headerSize       = 80          // 区块头固定长度（字节）
+	resultSize       = 40          // CUDAMiningResult结构体长度（字节）
+)
+
+type GPUMiner struct {
+	sync.Mutex
+	g                 *mining.BlkTmplGenerator
+	cfg               Config
+	numWorkers        uint32
+	started           bool
+	discreteMining    bool
+	submitBlockLock   sync.Mutex
+	updateNumWorkers  chan struct{}
+	queryHashesPerSec chan float64
+	updateHashes      chan uint64
+
+	wg               sync.WaitGroup
+	workerWg         sync.WaitGroup
+	speedMonitorQuit chan struct{}
+	quit             chan struct{}
+	currentTaskQuit  chan struct{} // 当前挖矿任务的终止信号（确保同一时间仅一个任务运行）
+
+	cudaMiner *CUDAMiner // GPU挖矿资源句柄
+}
+
+// New 创建纯GPU挖矿实例
+func New(cfg *Config) *GPUMiner {
+	miner := &GPUMiner{
+		g:                 cfg.BlockTemplateGenerator,
+		cfg:               *cfg,
+		queryHashesPerSec: make(chan float64),
+		updateHashes:      make(chan uint64),
+	}
+
+	cudaMiner := &CUDAMiner{
+		deviceID:    C.int(cfg.GPUDeviceID),
+		blockSize:   defaultBlockSize,
+		performance: cfg.GPUMiningPerformance,
+	}
+	if err := cudaMiner.Init(cfg.PTXFilePath); err != nil {
+		log.Infof("GPU挖矿初始化失败: %v", err)
+	}
+	miner.cudaMiner = cudaMiner
+	log.Infof("GPU挖矿初始化成功（设备ID: %d，性能占比: %d%%）", cfg.GPUDeviceID, cfg.GPUMiningPerformance)
+
+	return miner
+}
+
+// Init 初始化CUDA全流程资源
+func (cm *CUDAMiner) Init(ptxPath string) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.isInitialized {
+		return nil
+	}
+
+	var err C.CUresult
+
+	// 1. 初始化CUDA驱动
+	if err = C.cuInit(0); err != C.CUDA_SUCCESS {
+		return fmt.Errorf("cuInit失败 (错误码: %d)", err)
+	}
+
+	// 2. 检查GPU设备
+	var deviceCount C.int
+	if err = C.cuDeviceGetCount(&deviceCount); err != C.CUDA_SUCCESS {
+		return fmt.Errorf("获取设备数量失败 (错误码: %d)", err)
+	}
+	if deviceCount == 0 {
+		return fmt.Errorf("未检测到GPU设备")
+	}
+	if cm.deviceID >= deviceCount {
+		return fmt.Errorf("GPU设备ID %d 不存在（共%d个设备）", cm.deviceID, deviceCount)
+	}
+
+	// 3. 创建设备上下文
+	var device C.CUdevice
+	if err = C.cuDeviceGet(&device, cm.deviceID); err != C.CUDA_SUCCESS {
+		return fmt.Errorf("获取设备%d失败 (错误码: %d)", cm.deviceID, err)
+	}
+	if err = C.cuCtxCreate(&cm.context, 0, device); err != C.CUDA_SUCCESS {
+		return fmt.Errorf("创建上下文失败 (错误码: %d)", err)
+	}
+
+	// 4. 加载PTX模块
+	cPtxPath := C.CString(ptxPath)
+	defer C.free(unsafe.Pointer(cPtxPath))
+	if err = C.cuModuleLoad(&cm.module, cPtxPath); err != C.CUDA_SUCCESS {
+		C.cuCtxDestroy(cm.context)
+		return fmt.Errorf("加载PTX模块[%s]失败 (错误码: %d)", ptxPath, err)
+	}
+
+	// 5. 获取内核函数（需与miningKernel.cu中的函数名一致）
+	cKernelName := C.CString("findValidNonceGPU")
+	defer C.free(unsafe.Pointer(cKernelName))
+	if err = C.cuModuleGetFunction(&cm.kernel, cm.module, cKernelName); err != C.CUDA_SUCCESS {
+		C.cuModuleUnload(cm.module)
+		C.cuCtxDestroy(cm.context)
+		return fmt.Errorf("获取内核函数失败 (错误码: %d)", err)
+	}
+
+	// 6. 获取全局结果变量（devResult）
+	cResultVarName := C.CString("devResult")
+	defer C.free(unsafe.Pointer(cResultVarName))
+	var varSize C.size_t
+	if err = C.cuModuleGetGlobal(&cm.globalResultPtr, &varSize, cm.module, cResultVarName); err != C.CUDA_SUCCESS {
+		C.cuModuleUnload(cm.module)
+		C.cuCtxDestroy(cm.context)
+		return fmt.Errorf("获取全局变量devResult失败 (错误码: %d)", err)
+	}
+	if varSize != resultSize {
+		C.cuModuleUnload(cm.module)
+		C.cuCtxDestroy(cm.context)
+		return fmt.Errorf("全局变量devResult大小不匹配（期望%d字节，实际%d字节）", resultSize, varSize)
+	}
+
+	// 7. 计算网格大小（基于性能占比）
+	cm.calcGridSize()
+
+	cm.isInitialized = true
+	return nil
+}
+
+// calcGridSize 根据性能占比动态计算网格大小
+func (cm *CUDAMiner) calcGridSize() {
+	performance := cm.performance
+	if performance < 0 {
+		performance = 0
+	}
+	if performance > 100 {
+		performance = 100
+	}
+	// 按性能占比在[minGridSize, maxGridSize]区间分配
+	cm.gridSize = C.int(math.Round(float64(maxGridSize-minGridSize)*float64(performance)/100) + float64(minGridSize))
+	log.Debugf("GPU网格大小计算完成: %d (性能占比%d%%)", cm.gridSize, performance)
+}
+
+func (m *GPUMiner) speedMonitor() {
+	log.Tracef("CPU miner speed monitor started")
+
+	var hashesPerSec float64
+	var totalHashes uint64
+	ticker := time.NewTicker(time.Second * mining.HpsUpdateSecs)
+	defer ticker.Stop()
+
+out:
+	for {
+		select {
+		// Periodic updates from the workers with how many hashes they
+		// have performed.
+		case numHashes := <-m.updateHashes:
+			totalHashes += numHashes
+
+		// Time to update the hashes per second.
+		case <-ticker.C:
+			curHashesPerSec := float64(totalHashes) / mining.HpsUpdateSecs
+			if hashesPerSec == 0 {
+				hashesPerSec = curHashesPerSec
+			}
+			hashesPerSec = (hashesPerSec + curHashesPerSec) / 2
+			totalHashes = 0
+			if hashesPerSec != 0 {
+				log.Debugf("Hash speed: %6.0f kilohashes/s",
+					hashesPerSec/1000)
+			}
+
+		// Request for the number of hashes per second.
+		case m.queryHashesPerSec <- hashesPerSec:
+			// Nothing to do.
+
+		case <-m.speedMonitorQuit:
+			break out
+		}
+	}
+
+	m.wg.Done()
+	log.Tracef("CPU miner speed monitor done")
+}
+
+func (m *GPUMiner) Start() {
+	m.Lock()
+	defer m.Unlock()
+
+	if m.started || m.discreteMining {
+		return
+	}
+
+	// 初始化信号通道
+	m.quit = make(chan struct{})
+	m.speedMonitorQuit = make(chan struct{})
+	m.currentTaskQuit = make(chan struct{})
+	m.wg.Add(1)
+
+	// 启动算力监控
+	go m.speedMonitor()
+	// 启动任务调度器
+	go m.miningTaskScheduler()
+
+	m.started = true
+	log.Infof("纯GPU挖矿服务已启动")
+}
+
+func (m *GPUMiner) miningWorkerController() {
+	go m.miningTaskScheduler()
+}
+
+// miningTaskScheduler 单任务调度器：统一生成模板、启动/终止挖矿
+// miningTaskScheduler 单任务调度器（确保同一时间仅一个GPU任务运行）
+func (m *GPUMiner) miningTaskScheduler() {
+	m.workerWg.Add(1)
+	defer m.workerWg.Done()
+	log.Tracef("GPU挖矿任务调度器启动")
+
+	for {
+		select {
+		case <-m.quit:
+			log.Tracef("GPU调度器收到退出信号")
+			return
+		default:
+		}
+
+		// 1. 生成区块模板
+		m.submitBlockLock.Lock()
+		bestSnap := m.g.BestSnapshot()
+		curHeight := bestSnap.Height
+		payToAddr := m.cfg.MiningAddrs[0] // 简化：使用第一个挖矿地址
+		template, err := m.g.NewBlockTemplate(payToAddr, curHeight)
+		m.submitBlockLock.Unlock()
+
+		if err != nil {
+			log.Errorf("生成区块模板失败: %v，1秒后重试", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		// 2. 重置当前任务终止信号
+		m.Lock()
+		close(m.currentTaskQuit)
+		m.currentTaskQuit = make(chan struct{})
+		taskQuit := m.currentTaskQuit
+		m.Unlock()
+
+		log.Infof("开始新一轮GPU挖矿 | 目标高度: %d", curHeight+1)
+
+		// 3. 执行GPU挖矿（阻塞至完成/终止）
+		found := m.solveBlock(template.Block, curHeight+1, taskQuit)
+
+		// 4. 挖矿成功，提交区块
+		if found {
+			block := wire2.NewBlock(template.Block)
+			block.BlockHeight = curHeight + 1
+
+			// 计算链工作
+			bits := block.BlockHeader().Bits
+			work := blockchain.CalculateBlockWork(bits)
+			chainWork := blockchain.CalculateChainWork(bestSnap.ChainWork, bits)
+			sum := new(big.Int).Add(work, chainWork)
+			if err := block.SetChainWork(sum); err != nil {
+				log.Errorf("设置链工作失败: %v", err)
+				continue
+			}
+
+			m.submitBlock(block)
+			time.Sleep(500 * time.Millisecond) // 等待链同步
+		}
+	}
+}
+
+// solveBlock 纯GPU挖矿核心逻辑
+func (m *GPUMiner) solveBlock(msgBlock *wire2.MsgBlock, blockHeight int32, taskQuit chan struct{}) bool {
+	miningStartTime := time.Now().Unix()
+	msgBlock.Header.Timestamp = miningStartTime
+
+	// 1. 初始化参数
+	header := &msgBlock.Header
+	targetDifficulty := blockchain.CompactToBig(header.Bits)
+	timeoutThreshold := 15 * time.Minute // 与Java对齐的超时时间
+	cudaMiner := m.cudaMiner
+
+	log.Infof("GPU开始挖矿 | 高度: %d | 难度: %x | 超时阈值: %v",
+		blockHeight, targetDifficulty.Bytes(), timeoutThreshold)
+
+	// 2. 序列化区块头
+	headerData, err := serializeBlockHeader(header)
+	if err != nil {
+		log.Errorf("区块头序列化失败: %v", err)
+		return false
+	}
+
+	// 3. GPU资源分配与初始化
+	var (
+		dHeader C.CUdeviceptr // GPU上的区块头内存
+		errCuda C.CUresult
+	)
+	defer func() {
+		// 释放GPU临时内存（全局结果变量由CUDAMiner管理）
+		if dHeader != 0 {
+			C.cuMemFree(dHeader)
+			log.Debugf("GPU临时内存释放完成")
+		}
+	}()
+
+	// 3.1 分配GPU内存（区块头）
+	if errCuda = C.cuMemAlloc(&dHeader, C.size_t(headerSize)); errCuda != C.CUDA_SUCCESS {
+		log.Errorf("GPU内存分配失败 (错误码: %d)", errCuda)
+		return false
+	}
+
+	// 3.2 主机内存→GPU内存（复制区块头数据）
+	if errCuda = C.cuMemcpyHtoD(dHeader, C.CBytes(headerData), C.size_t(headerSize)); errCuda != C.CUDA_SUCCESS {
+		log.Errorf("内存复制到GPU失败 (错误码: %d)", errCuda)
+		return false
+	}
+
+	// 3.3 重置全局结果变量
+	resetResult := CUDAMiningResult{Found: 0, Nonce: 0}
+	if errCuda = C.cuMemcpyHtoD(cudaMiner.globalResultPtr, C.CBytes(&resetResult), C.size_t(resultSize)); errCuda != C.CUDA_SUCCESS {
+		log.Errorf("重置GPU结果变量失败 (错误码: %d)", errCuda)
+		return false
+	}
+
+	// 4. 配置内核参数（与miningKernel.cu的findValidNonceGPU参数对齐）
+	// 参数顺序：dHeader (区块头GPU指针), startNonce (起始随机数), endNonce (结束随机数)
+	startNonce := uint32(0)
+	endNonce := uint32(math.MaxUint32)
+	kernelParams := []unsafe.Pointer{
+		unsafe.Pointer(&dHeader),
+		unsafe.Pointer(&startNonce),
+		unsafe.Pointer(&endNonce),
+	}
+
+	// 5. 启动GPU内核（异步执行，配合超时检查）
+	log.Debugf("GPU内核启动 | 网格大小: %d | 线程块大小: %d", cudaMiner.gridSize, cudaMiner.blockSize)
+	if errCuda = C.cuLaunchKernel(
+		cudaMiner.kernel,
+		C.uint(cudaMiner.gridSize), 1, 1, // 网格维度
+		C.uint(cudaMiner.blockSize), 1, 1, // 线程块维度
+		0, nil, // 共享内存大小 + 流
+		(*unsafe.Pointer)(unsafe.Pointer(&kernelParams[0])), nil,
+	); errCuda != C.CUDA_SUCCESS {
+		log.Errorf("GPU内核启动失败 (错误码: %d)", errCuda)
+		return false
+	}
+
+	// 6. 轮询检查结果（兼顾超时、任务终止信号）
+	ticker := time.NewTicker(100 * time.Millisecond) // 100ms轮询一次
+	defer ticker.Stop()
+
+	for {
+		select {
+		// 6.1 任务终止信号（外部停止/区块过时）
+		case <-taskQuit:
+			log.Info("GPU挖矿任务被终止")
+			C.cuCtxSynchronize() // 确保内核停止后再退出
+			return false
+
+		// 6.2 超时检查
+		case <-time.After(timeoutThreshold):
+			log.Warnf("GPU挖矿超时（已运行%v）", miningStartTime)
+			C.cuCtxSynchronize()
+			return false
+
+		// 6.3 定期检查结果
+		case <-ticker.C:
+			// 6.3.1 同步GPU结果到主机
+			var gpuResult CUDAMiningResult
+			if errCuda = C.cuMemcpyDtoH(C.CBytes(&gpuResult), cudaMiner.globalResultPtr, C.size_t(resultSize)); errCuda != C.CUDA_SUCCESS {
+				log.Warnf("从GPU读取结果失败 (错误码: %d)，重试", errCuda)
+				continue
+			}
+
+			// 6.3.2 检查是否找到有效解
+			if gpuResult.Found == 1 {
+				log.Infof("GPU找到有效解 | Nonce: %d | 耗时: %v", gpuResult.Nonce, miningStartTime)
+
+				// 验证结果有效性（双重校验，避免GPU误判）
+				header.Nonce = gpuResult.Nonce
+				validHash := header.BlockHash()
+				if blockchain.HashToBig(&validHash).Cmp(targetDifficulty) > 0 {
+					log.Warnf("GPU返回的结果不符合难度要求，继续挖矿")
+					continue
+				}
+
+				// 结果有效，更新区块信息
+				msgBlock.Header.Nonce = gpuResult.Nonce
+				log.Infof("GPU挖矿成功 | 高度: %d | Nonce: %d | 哈希: %s",
+					blockHeight, gpuResult.Nonce, validHash)
+
+				// 汇报算力（估算值：总尝试次数/耗时）
+				hashes := float64(gpuResult.Nonce - startNonce)
+				hashRate := hashes / float64(miningStartTime)
+				m.updateHashes <- uint64(hashRate)
+
+				return true
+			}
+
+			// 6.3.3 检查区块是否过时
+			m.submitBlockLock.Lock()
+			isStale := !header.PrevBlock.IsEqual(&m.g.BestSnapshot().Hash)
+			m.submitBlockLock.Unlock()
+			if isStale {
+				log.Info("GPU挖矿的区块已过时，终止任务")
+				C.cuCtxSynchronize()
+				return false
+			}
+		}
+	}
+}
+
+func (m *GPUMiner) Stop() {
+	m.Lock()
+	defer m.Unlock()
+
+	if !m.started || m.discreteMining {
+		return
+	}
+
+	log.Infof("开始退出挖矿程序")
+
+	if m.speedMonitorQuit != nil {
+		close(m.speedMonitorQuit)
+		m.speedMonitorQuit = nil
+	}
+
+	if m.currentTaskQuit != nil {
+		close(m.currentTaskQuit)
+		m.currentTaskQuit = nil
+	}
+
+	if m.quit != nil {
+		close(m.quit)
+		m.quit = nil
+	}
+
+	// 3. 等待 workerWg（调度器）退出，增加超时保护
+	workerExit := make(chan struct{})
+	go func() {
+		m.workerWg.Wait()
+		close(workerExit)
+	}()
+	select {
+	case <-workerExit:
+		log.Infof("调度器协程已退出")
+	case <-time.After(10 * time.Second):
+		log.Warnf("调度器协程退出超时，可能存在泄漏")
+	}
+
+	// 4. 等待 wg（监控器+控制器）退出
+	wgExit := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(wgExit)
+	}()
+	select {
+	case <-wgExit:
+		log.Infof("监控器与控制器协程已退出")
+	case <-time.After(10 * time.Second):
+		log.Warnf("监控器协程退出超时，可能存在泄漏")
+	}
+
+	// 5. 重置状态
+	m.started = false
+	m.speedMonitorQuit = nil
+	log.Infof("CPU miner stopped completely")
+}
+
+func (m *GPUMiner) IsMining() bool {
+	m.Lock()
+	defer m.Unlock()
+	return m.started
+}
+
+func (m *GPUMiner) submitBlock(block *wire2.Block) bool {
+
+	log.Info("Submitting mined block")
+	m.submitBlockLock.Lock()
+	defer m.submitBlockLock.Unlock()
+
+	// 原有：检查区块是否过时
+	msgBlock := block.MsgBlock()
+	bestSnap := m.g.BestSnapshot()
+	if !msgBlock.Header.PrevBlock.IsEqual(&bestSnap.Hash) {
+		log.Debugf("Submitted block is stale (prev hash: %s)", msgBlock.Header.PrevBlock)
+		return false
+	}
+
+	// 处理区块
+	isOrphan, err := m.cfg.ProcessBlock(block, blockchain.BFNone)
+	if err != nil {
+		if _, ok := err.(blockchain.RuleError); !ok {
+			log.Errorf("Unexpected error processing block: %v", err)
+		} else {
+			log.Debugf("Block rejected: %v", err)
+		}
+		return false
+	}
+	if isOrphan {
+		log.Debugf("Submitted block is orphan")
+		return false
+	}
+
+	// 新增：区块接受后，立即终止当前挖矿任务
+	m.Lock()
+	if m.currentTaskQuit != nil {
+		close(m.currentTaskQuit)
+		m.currentTaskQuit = nil
+	}
+	m.Unlock()
+
+	// 原有日志
+	coinbaseTx := msgBlock.Transactions[0].TxOut[0]
+	log.Infof("Block accepted | Hash: %s | Reward: %v", block.Hash(), utils.Amount(coinbaseTx.Value))
+	return true
+}
+
+// SetNumWorkers 动态调整挖矿Worker数量
+func (m *GPUMiner) SetNumWorkers(num uint32) {
+	m.Lock()
+	defer m.Unlock()
+	if num == 0 {
+		num = defaultNumWorkers
+	}
+	m.numWorkers = num
+	// 发送信号通知solveBlock调整Worker
+	select {
+	case m.updateNumWorkers <- struct{}{}:
+	default:
+		// 避免通道阻塞（若前一个信号未处理，忽略重复信号）
+	}
+}
+
+// serializeBlockHeader 序列化区块头为80字节数组（小端序）
+func serializeBlockHeader(header *wire2.BlockHeader) ([]byte, error) {
+	buf := make([]byte, headerSize)
+	idx := 0
+
+	// 1. Version (4字节，小端)
+	buf[idx] = byte(header.Version)
+	buf[idx+1] = byte(header.Version >> 8)
+	buf[idx+2] = byte(header.Version >> 16)
+	buf[idx+3] = byte(header.Version >> 24)
+	idx += 4
+
+	// 2. PrevBlock (32字节，小端)
+	copy(buf[idx:idx+32], header.PrevBlock.CloneBytes())
+	idx += 32
+
+	// 3. MerkleRoot (32字节，小端)
+	copy(buf[idx:idx+32], header.MerkleRoot.CloneBytes())
+	idx += 32
+
+	// 4. Timestamp (4字节，小端)
+	buf[idx] = byte(header.Timestamp)
+	buf[idx+1] = byte(header.Timestamp >> 8)
+	buf[idx+2] = byte(header.Timestamp >> 16)
+	buf[idx+3] = byte(header.Timestamp >> 24)
+	idx += 4
+
+	// 5. Bits (4字节，小端)
+	buf[idx] = byte(header.Bits)
+	buf[idx+1] = byte(header.Bits >> 8)
+	buf[idx+2] = byte(header.Bits >> 16)
+	buf[idx+3] = byte(header.Bits >> 24)
+	idx += 4
+
+	// 6. Nonce (4字节，小端) - 初始值为0，由GPU填充
+	buf[idx] = 0
+	buf[idx+1] = 0
+	buf[idx+2] = 0
+	buf[idx+3] = 0
+	idx += 4
+
+	if idx != headerSize {
+		return nil, fmt.Errorf("区块头序列化长度错误（期望%d，实际%d）", headerSize, idx)
+	}
+	return buf, nil
+}

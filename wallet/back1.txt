@@ -1,0 +1,324 @@
+package wallet
+
+import (
+	"errors"
+	"fmt"
+	hdwallet "github.com/miguelmota/go-ethereum-hdwallet"
+	"github.com/tyler-smith/go-bip39"
+	"log"
+	"sync"
+)
+
+// Wallet 钱包结构体
+// 包含余额和用于并发安全的互斥锁
+// 包含
+type Wallet struct {
+	name         string  //名称
+	balance      float64 //余额 单位聪 最小单位
+	mnemonic     string  // 助记词（敏感，可恢复私钥）
+	password     string  // 密码（用于加密私钥/助记词，或验证操作权限）
+	passwordHash []byte  // 密码哈希（用于加密私钥/助记词及验证操作）
+	passwordHint string  // 密码提示（帮助用户回忆密码）
+	mu           sync.Mutex
+}
+
+func NewWallet(name, password, passwordHint string) (*Wallet, error) {
+	// 简单的密码强度检查
+	if len(password) < 8 {
+		return nil, errors.New("密码长度不能少于8位")
+	}
+
+	// 生成BIP-39标准助记词
+	mnemonic, err := generateBIP39Mnemonic()
+	if err != nil {
+		return nil, err
+	}
+
+	// 计算密码哈希（实际应用中应使用更复杂的哈希算法如bcrypt）
+	passwordHash, err := hashPassword(password)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Wallet{
+		name:         name,
+		balance:      0, // 新钱包初始余额为0
+		mnemonic:     mnemonic,
+		passwordHash: passwordHash,
+		passwordHint: passwordHint,
+	}, nil
+}
+
+// 生成符合BIP-39标准的助记词
+// 使用12个单词（128位熵 + 4位校验和）
+func generateBIP39Mnemonic() (string, error) {
+	entropy, err := bip39.NewEntropy(128)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	mnemonic, _ := bip39.NewMnemonic(entropy)
+	//var mnemonic = "pepper hair process town say voyage exhibit over carry property follow define"
+	fmt.Println("mnemonic:", mnemonic)
+	seed := bip39.NewSeed(mnemonic, "") //这里可以选择传入指定密码或者空字符串，不同密码生成的助记词不同
+
+	wallet, err := hdwallet.NewFromSeed(seed)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	path := hdwallet.MustParseDerivationPath("m/44'/60'/0'/0/0") //最后一位是同一个助记词的地址id，从0开始，相同助记词可以生产无限个地址
+	account, err := wallet.Derive(path, false)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	address := account.Address.Hex()
+	privateKey, _ := wallet.PrivateKeyHex(account)
+	publicKey, _ := wallet.PublicKeyHex(account)
+
+	fmt.Println("address0:", address)      // id为0的钱包地址
+	fmt.Println("privateKey:", privateKey) // 私钥
+	fmt.Println("publicKey:", publicKey)   // 公钥
+
+	path = hdwallet.MustParseDerivationPath("m/44'/60'/0'/0/1") //生成id为1的钱包地址
+	account, err = wallet.Derive(path, false)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("address1:", account.Address.Hex())
+
+	return "", nil
+}
+
+// 验证助记词是否符合BIP-39标准
+func ValidateMnemonic(mnemonic string) bool {
+	return bip39.IsMnemonicValid(mnemonic)
+}
+
+// 从助记词恢复钱包
+func RestoreWallet(name, password, passwordHint, mnemonic string) (*Wallet, error) {
+	// 验证助记词有效性
+	if !ValidateMnemonic(mnemonic) {
+		return nil, errors.New("无效的助记词")
+	}
+
+	// 密码强度检查
+	if len(password) < 8 {
+		return nil, errors.New("密码长度不能少于8位")
+	}
+
+	// 计算密码哈希
+	passwordHash, err := hashPassword(password)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Wallet{
+		name:         name,
+		balance:      0, // 恢复的钱包需要重新同步余额
+		mnemonic:     mnemonic,
+		passwordHash: passwordHash,
+		passwordHint: passwordHint,
+	}, nil
+}
+
+// 密码哈希函数（实际应用中应使用更安全的算法）
+func hashPassword(password string) ([]byte, error) {
+	// 这里简化处理，实际应用中应使用bcrypt或scrypt等算法
+	// 例如：return bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	return []byte(password), nil
+}
+
+// 验证密码
+func (w *Wallet) verifyPassword(password string) bool {
+	// 实际应用中应使用密码哈希验证
+	// 例如：return bcrypt.CompareHashAndPassword(w.passwordHash, []byte(password)) == nil
+	return string(w.passwordHash) == password
+}
+
+// GetBalance 获取钱包余额（并发安全）
+func (w *Wallet) GetBalance() float64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.balance
+}
+
+// Deposit 存入金额（并发安全）
+func (w *Wallet) Deposit(amount float64) error {
+	if amount <= 0 {
+		return errors.New("存入金额必须大于0")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.balance += amount
+	return nil
+}
+
+// Withdraw 取出金额（并发安全）
+func (w *Wallet) Withdraw(amount float64, password string) error {
+	if amount <= 0 {
+		return errors.New("取出金额必须大于0")
+	}
+	if !w.verifyPassword(password) {
+		return errors.New("密码错误，无法完成取款")
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.balance < amount {
+		return errors.New("余额不足")
+	}
+	w.balance -= amount
+	return nil
+}
+
+// GetName 获取钱包名称
+func (w *Wallet) GetName() string {
+	return w.name
+}
+
+// GetPasswordHint 获取密码提示
+func (w *Wallet) GetPasswordHint() string {
+	return w.passwordHint
+}
+
+// ExportMnemonic 导出助记词（需要密码验证，敏感操作）
+func (w *Wallet) ExportMnemonic(password string) (string, error) {
+	if !w.verifyPassword(password) {
+		return "", errors.New("密码错误，无法导出助记词")
+	}
+	return w.mnemonic, nil
+}
+
+//生成以太坊地址
+
+//生成比特币地址  参数 网络参数 主网等等 地址类型 P2PKH P2WPKH
+
+
+
+package main
+
+import (
+    "log"
+    "your-project-path/wallet" // 替换为你的wallet包路径
+)
+
+func main() {
+    // 1. 场景1：创建新钱包并生成多个以太坊地址
+    newWallet, err := wallet.NewWallet(
+        "我的以太坊钱包",  // 钱包名称
+        "StrongPass@123", // 钱包密码（需≥8位）
+        "包含数字和符号",  // 密码提示
+    )
+    if err != nil {
+        log.Fatalf("创建钱包失败: %v", err)
+    }
+
+    // 生成index=0的地址
+    addr0, priv0, pub0, err := newWallet.GenerateEthAddress(0)
+    if err != nil {
+        log.Fatalf("生成index=0地址失败: %v", err)
+    }
+    log.Printf("=== 以太坊地址（index=0） ===\n地址: %s\n私钥: %s\n公钥: %s\n", addr0, priv0, pub0)
+
+    // 生成index=1的地址（同一助记词的第二个地址）
+    addr1, priv1, pub1, err := newWallet.GenerateEthAddress(1)
+    if err != nil {
+        log.Fatalf("生成index=1地址失败: %v", err)
+    }
+    log.Printf("=== 以太坊地址（index=1） ===\n地址: %s\n私钥: %s\n公钥: %s\n", addr1, priv1, pub1)
+
+    // 2. 场景2：从助记词恢复并生成地址
+    // 先导出钱包助记词（需验证密码）
+    mnemonic, err := newWallet.ExportMnemonic("StrongPass@123")
+    if err != nil {
+        log.Fatalf("导出助记词失败: %v", err)
+    }
+
+    // 从助记词生成index=2的地址
+    addr2, priv2, pub2, err := wallet.GenerateEthAddressFromMnemonic(mnemonic, "", 2)
+    if err != nil {
+        log.Fatalf("从助记词生成地址失败: %v", err)
+    }
+    log.Printf("=== 从助记词生成（index=2） ===\n地址: %s\n私钥: %s\n公钥: %s\n", addr2, priv2, pub2)
+}
+
+
+
+
+
+
+package main
+
+import (
+    "fmt"
+    "your-project-path/wallet" // 替换为实际的wallet包路径
+)
+
+func main() {
+    // -------------------------- 示例1：从钱包实例生成比特币地址 --------------------------
+    // 1. 创建新钱包
+    newWallet, err := wallet.NewWallet(
+        "MyBTCWallet",   // 钱包名称
+        "StrongPass123!",// 钱包密码
+        "生日+姓名",     // 密码提示
+    )
+    if err != nil {
+        fmt.Printf("创建钱包失败: %v\n", err)
+        return
+    }
+
+    // 2. 生成主网P2WPKH地址（索引0）
+    p2wpkhAddr, p2wpkhPriv, p2wpkhPub, err := newWallet.GenerateBtcAddress(
+        wallet.BTCAddressTypeP2WPKH, // 隔离见证地址
+        wallet.BTCMainNet,           // 主网
+        0,                           // 地址索引
+    )
+    if err != nil {
+        fmt.Printf("生成P2WPKH地址失败: %v\n", err)
+        return
+    }
+    fmt.Println("=== 比特币主网P2WPKH地址（索引0） ===")
+    fmt.Printf("地址: %s\n", p2wpkhAddr)    // 如：bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq
+    fmt.Printf("私钥(WIF): %s\n", p2wpkhPriv) // 如：L1c8zLz...
+    fmt.Printf("公钥(Hex): %s\n\n", p2wpkhPub) // 如：02a3b...
+
+    // 3. 生成测试网P2PKH地址（索引1）
+    p2pkhTestAddr, p2pkhTestPriv, p2pkhTestPub, err := newWallet.GenerateBtcAddress(
+        wallet.BTCAddressTypeP2PKH, // 普通地址
+        wallet.BTCTestNet3,         // 测试网
+        1,                           // 地址索引
+    )
+    if err != nil {
+        fmt.Printf("生成测试网P2PKH地址失败: %v\n", err)
+        return
+    }
+    fmt.Println("=== 比特币测试网P2PKH地址（索引1） ===")
+    fmt.Printf("地址: %s\n", p2pkhTestAddr)    // 如：mxNEbRX8t9kWGpJ67f4Yi7xY6X8Ld7t3h5
+    fmt.Printf("私钥(WIF): %s\n", p2pkhTestPriv) // 如：cV1Y5...
+    fmt.Printf("公钥(Hex): %s\n\n", p2pkhTestPub) // 如：03b4c...
+
+    // -------------------------- 示例2：从外部助记词生成比特币地址 --------------------------
+    mnemonic := "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" // 测试助记词
+    passphrase := "my-secret-pass" // 自定义Seed密码
+
+    // 生成主网P2PKH地址（索引0）
+    addr, priv, pub, err := wallet.GenerateBtcAddressFromMnemonic(
+        mnemonic,
+        passphrase,
+        wallet.BTCAddressTypeP2PKH,
+        wallet.BTCMainNet,
+        0,
+    )
+    if err != nil {
+        fmt.Printf("从助记词生成地址失败: %v\n", err)
+        return
+    }
+    fmt.Println("=== 从外部助记词生成主网P2PKH地址 ===")
+    fmt.Printf("地址: %s\n", addr)
+    fmt.Printf("私钥(WIF): %s\n", priv)
+    fmt.Printf("公钥(Hex): %s\n", pub)
+}

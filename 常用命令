@@ -1,0 +1,81 @@
+Go 处理依赖的命令主要集中在 go mod 子命令中，以下是常用的依赖管理命令及其用途：
+📦 初始化模块
+bash
+复制
+go mod init <module-name>
+初始化一个新的 Go 模块，生成 go.mod 文件。
+🔍 依赖管理命令
+表格
+复制
+命令	说明	示例
+go get	添加/升级依赖	go get github.com/gorilla/mux@latest
+go mod tidy	清理未使用的依赖，添加缺失的依赖	go mod tidy
+go mod download	下载 go.mod 中列出的所有依赖	go mod download
+go mod vendor	将依赖复制到 vendor/ 目录，用于离线构建	go mod vendor
+go mod verify	校验依赖是否被篡改	go mod verify
+go list -m all	列出当前模块的所有依赖	go list -m all
+go mod graph	打印模块依赖图（用于调试依赖关系）	go mod graph
+go mod edit	手动编辑 go.mod 文件	go mod edit -replace=old@v=new@v
+🧹 清理模块缓存（可选）
+bash
+复制
+go clean -modcache
+清理 $GOPATH/pkg/mod 中的模块缓存（慎用）。
+✅ 常用组合示例
+bash
+复制
+# 初始化模块
+go mod init myapp
+
+$env:GOPROXY = "https://proxy.golang.org,direct"
+
+go get github.com/libp2p/go-libp2p-asn-util@latest
+
+go clean -modcache
+go mod tidy
+
+# 添加依赖
+go get github.com/gin-gonic/gin@latest
+
+# 清理未使用的依赖
+go mod tidy
+
+# 打包 vendor（可选）
+go mod vendor
+📌 提示
+从 Go 1.16 起，go install 也可用于安装特定版本的命令行工具（如 go install github.com/spf13/cobra-cli@latest）。
+使用 Go 1.18+ 时，建议搭配 go work 来管理多模块项目。
+如需进一步了解某个命令的用法，可运行：
+bash
+复制
+go help mod
+
+编译文件
+protoc --go_out=. block.proto
+protoc --go_out=. tx.proto
+protoc --go_out=. hashset.proto
+protoc --go_out=. bitcoin.proto
+
+protoc `
+  --proto_path=wire `
+  --go_out=wire --go_opt=paths=source_relative `
+  --go-grpc_out=wire --go-grpc_opt=paths=source_relative `
+  wire\bitcoin.proto
+
+# 编译生成 exe 文件
+go build -o bitcoin.exe .
+
+
+$env:CGO_ENABLED=0; $env:GOOS="linux"; $env:GOARCH="amd64"; go build -o bitcoin
+
+$env:CGO_ENABLED=0; $env:GOOS="windows"; $env:GOARCH="amd64"; go build -o bitcoin.exe .
+
+    "github.com/miguelmota/go-ethereum-hdwallet"
+    "github.com/tyler-smith/go-bip39"
+
+
+
+完成网络消息传播
+完成索引重建
+完善交易消息广播
+同步后工作总量不正确
